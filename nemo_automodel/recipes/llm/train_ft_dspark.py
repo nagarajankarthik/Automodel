@@ -1,0 +1,1511 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Modify TrainFinetuneRecipeForNextTokenPrediction recipe in train_ft.py to allow 
+training a DSpark drafter simultanously with the main model on the same set of 
+GPUs.
+"""
+
+
+from __future__ import annotations
+
+import warnings
+
+# Suppress pydantic v2 UnsupportedFieldAttributeWarning before heavy imports
+# (transformers, huggingface_hub) trigger schema generation.
+try:
+    from pydantic.warnings import UnsupportedFieldAttributeWarning
+
+    warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+except ImportError:
+    pass
+
+import gc
+import inspect
+import logging
+import pathlib
+import time
+from contextlib import nullcontext
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, Optional
+
+import mlflow
+import torch
+import torch.nn as nn
+import wandb
+from huggingface_hub import constants as hf_constants
+from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+from transformers import AutoConfig
+
+from nemo_automodel._transformers import NeMoAutoModelForCausalLM, NeMoAutoModelForSequenceClassification
+from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
+from nemo_automodel._transformers.infrastructure import (
+    apply_model_infrastructure,
+    instantiate_infrastructure,
+)
+from nemo_automodel._transformers.mfu import AutoMFU
+from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
+from nemo_automodel.components.datasets.loader import DataloaderConfig
+from nemo_automodel.components.distributed.config import DistributedSetup, FSDP2Config, MegatronFSDPConfig
+from nemo_automodel.components.distributed.context_parallel import ContextParallelSharder
+from nemo_automodel.components.distributed.context_parallel.magi import MagiState, setup_magi
+from nemo_automodel.components.distributed.init_utils import initialize_distributed
+from nemo_automodel.components.distributed.mesh import MeshContext
+from nemo_automodel.components.distributed.pipelining import AutoPipeline
+from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
+from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
+from nemo_automodel.components.loggers.mlflow_utils import (
+    end_mlflow_active_run_as_killed,
+    to_float_metrics,
+)
+from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
+from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import calculate_mtp_loss
+from nemo_automodel.components.loss.utils import _get_lm_head_weight, calculate_loss
+from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+from nemo_automodel.components.quantization.fp8 import build_fp8_config
+from nemo_automodel.components.training.model_output_utils import get_final_hidden_states
+from nemo_automodel.components.training.rng import ScopedRNG, StatefulRNG
+from nemo_automodel.components.training.utils import (
+    count_tail_padding,
+    get_expert_tp_replication_factor,
+    prepare_after_first_microbatch,
+    prepare_for_final_backward,
+    prepare_for_grad_accumulation,
+    scale_grads_and_clip_grad_norm,
+)
+from nemo_automodel.components.utils.compile_utils import (
+    build_compile_config,
+)
+from nemo_automodel.components.utils.flops_utils import calculate_mfu
+from nemo_automodel.components.utils.model_utils import (
+    _supports_logits_to_keep,
+    _supports_seq_lens,
+    filter_forward_kwargs,
+    resolve_trust_remote_code,
+)
+from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config, shard_optimizers_for_megatron_fsdp
+from nemo_automodel.recipes._typed_config import RecipeConfig
+from nemo_automodel.recipes.base_recipe import BaseRecipe
+from nemo_automodel.shared.te_patches import apply_te_patches
+
+if TYPE_CHECKING:
+    from torch.optim import Optimizer
+
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------
+#  Stateless helper functions
+# ---------------------------
+def _get_model_name(cfg_model):
+    if cfg_model.get("pretrained_model_name_or_path", None) is not None:
+        return cfg_model.pretrained_model_name_or_path
+    elif cfg_model.get("config", None) is not None:
+        if isinstance(cfg_model.config, str):
+            return cfg_model.config
+        return cfg_model.config.get("pretrained_model_name_or_path", None)
+    else:
+        return None
+
+
+def _should_pack_validation(
+    training_dataloader: DataloaderConfig | None,
+    validation_dataloader: DataloaderConfig,
+    model: nn.Module,
+) -> bool:
+    """Return whether validation must use the configured training packer."""
+    if validation_dataloader.packing is None:
+        return False
+    if replace(validation_dataloader, packing=None).emits_thd:
+        return True
+    if training_dataloader is None or not training_dataloader.emits_thd:
+        return False
+    model_requires_packing = bool(
+        callable(getattr(model, "should_pack_validation_with_training", None))
+        and model.should_pack_validation_with_training()
+    )
+    model_config = getattr(model, "config", None)
+    attention_backend = getattr(getattr(model, "backend", None), "attn", None) or getattr(
+        model_config, "_attn_implementation", None
+    )
+    return (
+        attention_backend in ("te", "magi")
+        or bool(getattr(model, "_te_attention_injected", False))
+        or model_requires_packing
+    )
+
+
+def _should_precompute_pp_causal_masks(model_config: Any) -> bool:
+    """Return whether the recipe should attach PP causal-mask precomputation."""
+    return getattr(model_config, "model_type", None) != "deepseek_v4"
+
+
+def _maybe_downgrade_loss_fn(loss_fn: nn.Module, probe_module: nn.Module, pp_enabled: bool) -> nn.Module:
+    """Downgrade to MaskedCrossEntropy when the requested loss cannot run."""
+    if not _supports_logits_to_keep(probe_module) and not isinstance(loss_fn, MaskedCrossEntropy):
+        logger.warning("logits_to_keep not found in model.forward. Using MaskedCrossEntropy instead.")
+        return MaskedCrossEntropy()
+    if (
+        pp_enabled
+        and isinstance(loss_fn, FusedLinearCrossEntropy)
+        and not getattr(probe_module, "_pp_return_hidden_states_supported", False)
+    ):
+        logger.warning(
+            "FusedLinearCrossEntropy is not supported under pipeline parallelism for this "
+            "model. Using MaskedCrossEntropy instead."
+        )
+        return MaskedCrossEntropy()
+    return loss_fn
+
+
+def build_model(
+    cfg_model,
+    cfg_peft,
+    seed,
+    has_packed_sequence=False,
+    cfg_fp8=None,
+    cfg_compile=None,
+    cfg_quantization=None,
+    distributed_setup: DistributedSetup | None = None,
+    cfg_qat=None,
+    unfreeze_modules: list[str] | None = None,
+    sdpa_method: list[str] | None = None,
+    device_mesh=None,
+) -> tuple[nn.Module | AutoPipeline, list["Optimizer"]]:  # noqa: F821
+    """Build and initialize a model.
+
+    Args:
+        cfg_model: Configuration for model instantiation.
+        cfg_peft: Configuration for PEFT.
+        seed: Random seed.
+        has_packed_sequence: Whether using packed sequences.
+        cfg_fp8: Configuration for FP8.
+        cfg_compile: Configuration for torch.compile.
+        cfg_quantization: Configuration for BitsAndBytes quantization.
+        distributed_setup: Resolved distributed topology and policy object.
+        cfg_qat: Configuration for QAT (will be instantiated to QATConfig).
+        unfreeze_modules: List of module names/substrings to unfreeze.
+        sdpa_method: Explicit list of SDPA backend name strings (e.g.
+            ``["flash_attention", "efficient_attention"]``), or ``None`` to
+            auto-select based on CP / activation checkpointing.
+        device_mesh: Pre-created device mesh forwarded when ``distributed_setup`` is not provided.
+    """
+    with ScopedRNG(seed=seed, ranked=True):
+        kwargs = {
+            "has_packed_sequence": has_packed_sequence,
+            "peft_config": cfg_peft,
+            "sdpa_method": sdpa_method,
+        }
+        if distributed_setup is not None:
+            kwargs["distributed_setup"] = distributed_setup
+        elif device_mesh is not None:
+            kwargs["device_mesh"] = device_mesh
+
+        if cfg_qat is not None and cfg_qat.get("enabled", False):
+            if cfg_peft is not None:
+                raise ValueError("QAT with PEFT is not currently supported")
+            qat_config_attr = getattr(cfg_qat, "qat_config", None)
+            if qat_config_attr is not None:
+                kwargs["qat_config"] = qat_config_attr.instantiate()
+            else:
+                # Fallback to legacy quantizer format for backward compatibility
+                quantizer_attr = getattr(cfg_qat, "quantizer", None)
+                if quantizer_attr is not None:
+                    kwargs["qat_config"] = quantizer_attr.instantiate()
+
+        if cfg_fp8 is not None:
+            kwargs["fp8_config"] = build_fp8_config(cfg_fp8)
+        if cfg_compile is not None:
+            kwargs["compile_config"] = build_compile_config(cfg_compile)
+        if cfg_quantization is not None:
+            logger.info("Model weight quantization enabled with BitsAndBytes")
+            from nemo_automodel.components.quantization.qlora import create_bnb_config
+
+            kwargs["quantization_config"] = create_bnb_config(cfg_quantization)
+
+        is_nemo_auto_model = cfg_model.get("_target_", None) in (
+            NeMoAutoModelForCausalLM.from_config,
+            NeMoAutoModelForCausalLM.from_pretrained,
+            NeMoAutoModelForSequenceClassification.from_config,
+            NeMoAutoModelForSequenceClassification.from_pretrained,
+        )
+
+        if is_nemo_auto_model:
+            # NeMoAutoModel handles infrastructure internally
+            model = cfg_model.instantiate(**kwargs)
+        else:
+            # For non-NemoAutoModel entry points (e.g., build_gpt2_model),
+            # instantiate the model first, then apply infrastructure separately.
+            # Note: sdpa_method is not supported here — SDPA patching only runs
+            # inside NeMoAutoModel._build_model.
+            if sdpa_method is not None:
+                logger.warning("sdpa_method is ignored for non-NeMoAutoModel targets.")
+            # We must convert config objects into runtime objects (model_wrapper,
+            # autopipeline, parallelize_fn, etc.) via instantiate_infrastructure,
+            # exactly as from_pretrained/from_config do internally.
+            model = cfg_model.instantiate()
+
+            setup = distributed_setup or DistributedSetup(mesh_context=MeshContext())
+            mesh = setup.mesh_context
+            pipeline_config = setup.pipeline_config
+            model_wrapper, autopipeline, parallelize_fn, qat_quantizer = instantiate_infrastructure(
+                distributed_config=setup.strategy_config,
+                pipeline_config=pipeline_config,
+                qat_config=kwargs.get("qat_config"),
+                moe_parallel_config=setup.moe_parallel_config,
+                activation_checkpointing=setup.activation_checkpointing,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                mesh=mesh,
+            )
+            loss_fn = pipeline_config.loss_fn if pipeline_config is not None else None
+
+            model = apply_model_infrastructure(
+                model,
+                is_meta_device=False,
+                device=torch.cuda.current_device(),
+                mesh=mesh,
+                model_wrapper=model_wrapper,
+                autopipeline=autopipeline,
+                parallelize_fn=parallelize_fn,
+                qat_quantizer=qat_quantizer,
+                loss_fn=loss_fn,
+                peft_config=kwargs.get("peft_config"),
+                fp8_config=kwargs.get("fp8_config"),
+                compile_config=kwargs.get("compile_config"),
+                quantization_config=kwargs.get("quantization_config"),
+                pretrained_model_name_or_path=None,
+                load_base_model=False,
+                cache_dir=hf_constants.HF_HUB_CACHE,
+            )
+
+    # Explicitly unfreeze specified modules (e.g. task heads) that need full fine-tuning
+    if unfreeze_modules:
+        for name, param in model.named_parameters():
+            if any(module_name in name for module_name in unfreeze_modules):
+                param.requires_grad_(True)
+        logging.info(f"Unfroze parameters matching: {unfreeze_modules}")
+
+    return model
+
+
+def compute_trust_remote_code_from_model(cfg_model):
+    """Compute the value of trust_remote_code based on the model configuration.
+
+    Args:
+        cfg_model (ConfigNode): Model configuration.
+
+    Returns:
+        bool: Whether to trust remote code.
+    """
+    if hasattr(cfg_model, "trust_remote_code"):
+        return getattr(cfg_model, "trust_remote_code")
+    elif hasattr(cfg_model, "config") and hasattr(cfg_model.config, "trust_remote_code"):
+        return getattr(cfg_model.config, "trust_remote_code")
+    return resolve_trust_remote_code(_get_model_name(cfg_model))
+
+
+def _build_tokenizer(cfg_model, cfg_ds):
+    trust_remote_code = compute_trust_remote_code_from_model(cfg_model)
+    # if tokenizer is not provided, use the model config to instantiate it
+    if "tokenizer" not in cfg_ds and _get_model_name(cfg_model) is not None:
+        logging.info("Using model config to instantiate tokenizer")
+        tokenizer = NeMoAutoTokenizer.from_pretrained(_get_model_name(cfg_model), trust_remote_code=trust_remote_code)
+    elif cfg_ds.get("tokenizer", None) is None:
+        tokenizer = None
+    elif "_target_" not in cfg_ds.tokenizer:
+        tokenizer_dict = cfg_ds.tokenizer.to_dict()
+        trust_remote_code = tokenizer_dict.pop("trust_remote_code", trust_remote_code)
+        tokenizer = NeMoAutoTokenizer.from_pretrained(**tokenizer_dict, trust_remote_code=trust_remote_code)
+    else:
+        trust_remote_code = cfg_ds.tokenizer.to_dict().pop("trust_remote_code", trust_remote_code)
+        tokenizer = cfg_ds.tokenizer.instantiate(trust_remote_code=trust_remote_code)
+
+    # Finally, check if the dataset target accepts a tokenizer parameter
+    kwargs = {}
+    if tokenizer is not None and callable(cfg_ds._target_):
+        try:
+            sig = inspect.signature(cfg_ds._target_)
+            if "tokenizer" in sig.parameters:
+                kwargs["tokenizer"] = tokenizer
+        except (ValueError, TypeError):
+            # If we can't get the signature, skip adding tokenizer
+            pass
+    return kwargs, tokenizer
+
+
+def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
+    """Return a collate-fn wrapper that precomputes pipeline-parallel causal masks, or ``None``.
+
+    ``None`` when PP is disabled, the model config can't be loaded, or the model
+    computes masks internally (e.g. ``deepseek_v4``).  Passed to
+    :meth:`DataloaderConfig.build` as ``collate_wrapper``.
+    """
+    if not pp_enabled:
+        return None
+    try:
+        hf_model_config = AutoConfig.from_pretrained(
+            _get_model_name(cfg_model), trust_remote_code=compute_trust_remote_code_from_model(cfg_model)
+        )
+    except Exception:
+        logger.warning(
+            "Failed to load model config for causal mask precomputation. "
+            "Pipeline parallel mask precomputation will be skipped."
+        )
+        return None
+    if not _should_precompute_pp_causal_masks(hf_model_config):
+        logger.info(
+            "Skipping pipeline parallel causal mask precomputation for model_type=%s.",
+            getattr(hf_model_config, "model_type", None),
+        )
+        return None
+
+    from nemo_automodel.components.datasets.utils import add_causal_masks_to_batch
+
+    def wrapper(base_collate_fn):
+        def chained_collate_fn(batch, base_fn=base_collate_fn, config=hf_model_config):
+            """Collate examples and attach pipeline-parallel causal masks.
+
+            Args:
+                batch: Raw examples accepted by ``base_fn``. Standard token-list fields have per-example shape
+                    ``[S_i]`` and pre-batched tensor fields have shape ``[B_i, ...]``, where ``S_i`` is an
+                    example sequence length and ``B_i`` is a source batch size.
+
+            Returns:
+                Collated mapping whose standard token tensors have shape ``[B, S]``, where ``B`` is local batch
+                size and ``S`` is padded sequence length, plus ``causal_mask_mapping`` entries covering the
+                same ``S`` token axis. Other tensor fields preserve the base collator's documented layout.
+            """
+            return add_causal_masks_to_batch(base_fn(batch), model_config=config)
+
+        return chained_collate_fn
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+#  Trainer class – orchestration only
+# ---------------------------------------------------------------------------
+
+
+class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
+    """Recipe for fine-tuning a model for next-token prediction.
+
+    This class orchestrates training, from setup to main training loop.
+    """
+
+    # MagiAttention is disabled until setup() resolves it from config; this
+    # disabled default keeps _forward_backward_step working if setup() is skipped
+    # (e.g. unit tests that exercise the step directly). It is read-only.
+    magi = MagiState()
+
+    def __init__(self, cfg):
+        """Initialize the recipe with configuration.
+
+        Args:
+            cfg: Configuration dictionary/object for training.  May be a raw
+                ``ConfigNode`` or an already-coerced ``RecipeConfig`` — the
+                wrapper is idempotent.
+        """
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
+
+    # ------------------ build phase ------------------
+    def _create_distributed_setup(self) -> DistributedSetup:
+        """Create the distributed setup used by this recipe rank."""
+        return create_distributed_setup_from_config(self.cfg, world_size=self.dist_env.world_size)
+
+    def _should_setup_training_components(self) -> bool:
+        """Whether this rank owns the trainable model and its components."""
+        return True
+
+    def setup(self):
+        """Builds all components needed for training/validation/logging/checkpointing/etc.
+
+        This is the last place where self.cfg should be referenced.
+
+        Raises:
+            NotImplemented: Raises if it tries to restore a checkpoint; will be removed.
+        """
+        torch.cuda.reset_peak_memory_stats()
+        self.dist_env = initialize_distributed(
+            backend=self.cfg.get("dist_env", {}).get("backend", "nccl"),
+            timeout_minutes=self.cfg.get("dist_env", {}).get("timeout_minutes", 1),
+        )
+        # setups logging and adds the rankfilter to logging
+        setup_logging()
+
+        apply_cache_compatibility_patches()
+        apply_te_patches()
+        # Set up the stateful random number generator
+        self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
+        # Enable NVTX patching only when explicitly requested in config
+        self.enable_nvtx = bool(self.cfg.get("nvtx", False))
+
+        (
+            self.distributed_setup,
+            self.mesh_context,
+            self.distributed_config,
+            self.device_mesh,
+            self.moe_mesh,
+            self.pp_enabled,
+            self.pipeline_config,
+            self.moe_parallel_config,
+            self.activation_checkpointing,
+        ) = self._distributed_setup_attributes(self._create_distributed_setup())
+
+        if not self._should_setup_training_components():
+            return
+
+        # MagiAttention (FFA / context-parallel) backend, enabled via
+        # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
+        self.magi = setup_magi(self.cfg, self.device_mesh)
+
+        if self.dist_env.is_main and self.cfg.wandb is not None:
+            suppress_wandb_log_messages()
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
+            logging.info("🚀 View run at {}".format(run.url))
+
+        if self.dist_env.is_main and self.cfg.mlflow is not None:
+            run_config = self.cfg.to_yaml_dict(use_orig_values=True)
+            checkpoint_dir = self.cfg.get("checkpoint.checkpoint_dir", None)
+            if self.cfg.mlflow.build(checkpoint_dir=checkpoint_dir, run_config=run_config) is not None:
+                logging.info("MLflow experiment tracking enabled")
+
+        self.comet_logger = None
+        if self.dist_env.is_main and self.cfg.comet is not None:
+            self.comet_logger = self.cfg.comet.build(model_name=_get_model_name(self.cfg.model))
+            self.comet_logger.log_params(self.cfg.to_dict())
+            logging.info("Comet experiment tracking enabled")
+
+        # Log experiment details on main rank
+        self._log_experiment_details()
+        self._log_library_versions()
+
+        # Build loss_fn (will be set on pipeline_config if PP enabled)
+        self.loss_fn = self.cfg.loss_fn.build()
+        if self.magi.hf_dispatch and isinstance(self.loss_fn, FusedLinearCrossEntropy):  # pragma: no cover
+            raise ValueError(
+                "The magi HF backend needs full logits and is incompatible with "
+                "FusedLinearCrossEntropy; use a logits-based loss (e.g. MaskedCrossEntropy)."
+            )
+
+        # Pipeline runtime fields: override pp_batch_size and pp_microbatch_size
+        if self.pp_enabled:
+            pp_batch_size = self.cfg.get("step_scheduler.local_batch_size", 1)
+            pp_microbatch_size = self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+
+            assert pp_batch_size // pp_microbatch_size >= self.mesh_context.pp_size, (
+                f"pp_batch_size {pp_batch_size} // pp_microbatch_size {pp_microbatch_size} must be >= pp_size {self.mesh_context.pp_size}"
+            )
+
+            # THD override logic
+            if (
+                self.mesh_context.cp_size > 1
+                and self.cfg.get("model.backend.attn", self.cfg.get("model.attn_implementation", None)) == "te"
+                and self.cfg.dataloader is not None
+                and self.cfg.dataloader.emits_thd
+            ):
+                pp_microbatch_size = 1
+                pp_batch_size = pp_batch_size // self.cfg.get("distributed.pipeline.pp_microbatch_size", 1)
+                logging.info(
+                    f"Overriding pp_batch_size: {pp_batch_size}, pp_microbatch_size: {pp_microbatch_size} for THD"
+                )
+
+            assert not isinstance(self.distributed_config, MegatronFSDPConfig), (
+                "MegatronFSDPConfig is not supported when pipeline parallelism is enabled"
+            )
+
+            # Update pipeline_config runtime fields
+            self.pipeline_config.pp_batch_size = pp_batch_size
+            self.pipeline_config.pp_microbatch_size = pp_microbatch_size
+            self.pipeline_config.patch_stage_backward_maybe_with_nosync = self.cfg.get(
+                "model.backend.enable_fsdp_optimizations", False
+            )
+            self.pipeline_config.loss_fn = self.loss_fn
+
+            # Infer pp_seq_len from dataset config if not explicitly set
+            if hasattr(self.pipeline_config, "pp_seq_len") and self.pipeline_config.pp_seq_len is None:
+                packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
+                if packed_seq_size > 0:
+                    self.pipeline_config.pp_seq_len = packed_seq_size
+                elif self.cfg.get("dataset.seq_len", None) is not None:
+                    self.pipeline_config.pp_seq_len = self.cfg.dataset.seq_len
+
+        # Build components
+        self.peft_config = None
+        if self.cfg.get("peft", None) is not None:
+            self.peft_config = self.cfg.peft.instantiate()
+
+        # Checkpoint config (model-derived fields are filled in by RecipeConfig)
+        checkpoint_config = self.cfg.checkpoint
+
+        if self.cfg.get("clip_grad_norm.max_norm", None) is not None:
+            self.max_grad_norm = float(self.cfg.clip_grad_norm.max_norm)
+        else:
+            logging.info("No clip_grad_norm.max_norm specified in config, using default value of 1.0")
+            self.max_grad_norm = 1.0
+
+        # Build the checkpointer from its config
+        self.checkpointer = checkpoint_config.build(
+            dp_rank=self._get_dp_rank(include_cp=True),
+            tp_rank=self._get_tp_rank(),
+            pp_rank=self._get_pp_rank(),
+            moe_mesh=self.moe_mesh,
+            process_group=getattr(self.mesh_context, "process_group", None),
+            pp_group=self._get_pp_group(),
+        )
+
+        # Disable fused RoPE when context parallelism is enabled (cp > 1)
+        if self.mesh_context.cp_size > 1 and self.cfg.get("model.backend.rope_fusion", False):
+            logging.info("Disabling rope_fusion because cp_size=%d > 1", self.mesh_context.cp_size)
+            self.cfg.model.backend.rope_fusion = False
+
+        model = build_model(
+            self.cfg.model,
+            self.peft_config,
+            has_packed_sequence=self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0,
+            seed=self.cfg.get("seed", 42),
+            cfg_fp8=self.cfg.get("fp8", None),
+            cfg_compile=self.cfg.get("compile", None),
+            cfg_quantization=self.cfg.get("quantization", None),
+            distributed_setup=self.distributed_setup,
+            cfg_qat=self.cfg.get("qat", None),
+            sdpa_method=self.cfg.get("sdpa_method", None),
+        )
+        self.embedding_row_repair_report = None
+        embedding_row_repair = self.cfg.embedding_row_repair
+        if embedding_row_repair is not None and embedding_row_repair.enabled:
+            if isinstance(model, AutoPipeline):
+                raise ValueError("embedding_row_repair is not currently supported with pipeline parallelism")
+            self.embedding_row_repair_report = embedding_row_repair.apply(model)
+        optimizer = self.cfg.optimizer.build(model, device_mesh=self.device_mesh, is_peft=self.peft_config is not None)
+        allow_megatron_fsdp_sharding = getattr(self.cfg.optimizer, "supports_megatron_fsdp_sharding", True)
+        self.optimizer = shard_optimizers_for_megatron_fsdp(
+            model, optimizer, self.distributed_config, allow=allow_megatron_fsdp_sharding
+        )
+
+        if isinstance(model, AutoPipeline):
+            self.model_parts = model.parts
+            self.pp = model
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                # Patch each pipeline stage with NVTX profiling
+                for i, part in enumerate(self.model_parts):
+                    autonvtx.patch(part, name=f"PipelineStage_{i}")
+        else:
+            if self.enable_nvtx:
+                import nemo_automodel.autonvtx as autonvtx
+
+                # Patch model with NVTX profiling
+                autonvtx.patch(model, name=model.__class__.__name__)
+            self.model_parts = [model]
+            self.pp = None
+
+        # Loss-function capability check
+        self.loss_fn = _maybe_downgrade_loss_fn(self.loss_fn, self.model_parts[0], self.pp is not None)
+
+        # Extract TE FP8 config from model backend (set after model construction)
+        self.te_fp8 = self.model_parts[0].backend.te_fp8 if hasattr(self.model_parts[0], "backend") else None
+
+        if self.pp_enabled:
+            self._configure_pipeline_loss_fn()
+
+        # Optional setup-time prewarms (cuBLAS workspaces, Triton autotune
+        # caches, NCCL communicators) while the allocator pool is still small,
+        # instead of lazily at step-1 peak memory.
+        if self.cfg.prewarm is not None:
+            self.cfg.prewarm.apply(
+                model_parts=self.model_parts,
+                device=self.dist_env.device,
+                pp_mesh=(self.device_mesh["pp"] if self.pp_enabled and self.device_mesh is not None else None),
+            )
+
+        _packed_seq_size = self.cfg.get("packed_sequence.packed_sequence_size", 0)
+        if self.mesh_context.cp_size > 1 and _packed_seq_size > 0:
+            _m = self.model_parts[0]
+            if hasattr(_m, "supports") and not _m.supports_cp_with_sequence_packing:
+                raise ValueError(
+                    f"Context parallelism (cp_size={self.mesh_context.cp_size}) with packed sequences "
+                    f"is not supported for {type(_m).__name__}.\n"
+                    f"Either disable sequence packing:\n"
+                    f"  packed_sequence:\n"
+                    f"    packed_sequence_size: 0\n"
+                    f"or switch to the TE attention backend -- MoE models only:\n"
+                    f"  model:\n"
+                    f"    backend:\n"
+                    f"      attn: te"
+                )
+
+        # Tokenizer + model-derived values are runtime concerns: build them here and pass them to
+        # each DataloaderConfig.build(); the configs themselves are resolved at the RecipeConfig boundary.
+        _, self.tokenizer = _build_tokenizer(self.cfg.model, self.cfg.dataset)
+        attn_implementation = None
+        if (
+            self.cfg.get("packed_sequence.packed_sequence_size", 0) > 0
+            and self.cfg.get("packed_sequence.packing_strategy", "thd") == "neat"
+        ):
+            from nemo_automodel.components.models.common.packing import configure_packing, get_attn_implementation
+
+            attn_implementation = get_attn_implementation(self.cfg.model)
+            configure_packing(attn_implementation=attn_implementation)
+        collate_wrapper = _build_pp_collate_wrapper(self.cfg.model, self.pp_enabled)
+
+        def materialize_loader(config):
+            process_group = getattr(self.mesh_context, "process_group", None)
+            build_context = (
+                nullcontext() if config.dataset_builds_on_all_ranks else FirstRankPerNode(group=process_group)
+            )
+            with ScopedRNG(seed=config.seed, ranked=True):
+                return config.build(
+                    tokenizer=self.tokenizer,
+                    dataset_build_context=build_context,
+                    dp_rank=self._get_dp_rank(),
+                    dp_world_size=self._get_dp_group_size(),
+                    pp_enabled=self.pp_enabled,
+                    supports_seq_lens=_supports_seq_lens(self.model_parts[0]),
+                    cp_size=self.cfg.get("distributed.cp_size", 1),
+                    attn_implementation=attn_implementation,
+                    collate_wrapper=collate_wrapper,
+                )
+
+        self.dataloader = materialize_loader(self.cfg.dataloader)
+        self.val_dataloaders = {
+            name: materialize_loader(
+                dl_config
+                if _should_pack_validation(self.cfg.dataloader, dl_config, self.model_parts[0])
+                else replace(dl_config, packing=None)
+            )
+            for name, dl_config in self.cfg.validation_dataloaders.items()
+        }
+        # Optional tool-call accuracy evaluator for agent SFT runs.
+        # Presence of the ``tool_call_eval`` block enables it; absence skips it.
+        self.tool_call_evaluator = None
+        tool_call_eval_cfg = self.cfg.get("tool_call_eval", None)
+        if tool_call_eval_cfg is not None:
+            self.tool_call_evaluator = tool_call_eval_cfg.instantiate()
+            # Shard eval samples across DP ranks only when safe (DDP); never
+            # override a ``sample_shard`` already set from YAML.
+            if self.tool_call_evaluator.sample_shard is None:
+                self.tool_call_evaluator.sample_shard = dp_eval_sample_shard(
+                    self.distributed_config, self._get_dp_rank(), self._get_dp_group_size()
+                )
+        self._warned_tool_call_eval_skipped = False
+        self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
+        # Scheduler — typed configs from RecipeConfig, built with runtime args here.
+        self.step_scheduler = self.cfg.step_scheduler.build(
+            self.dataloader,
+            self._get_dp_group_size(),
+            self.cfg.get("step_scheduler.local_batch_size", 1),
+            process_group=getattr(self, "_training_process_group", None),
+        )
+        self._setup_garbage_collection(self.step_scheduler)
+
+        # Build learning rate scheduler (None when no lr_scheduler section).
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
+
+        # Log model, parameter counts, norms, optimizer and scheduler
+        self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
+
+        # Handle delayed fake-quant toggling for QAT if configured
+        self._qat_disable_fn, self._qat_enable_fn, self._qat_enable_after = self._setup_qat(self.cfg, self.model_parts)
+
+        # Enable MoE load balance tracking if configured
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        if moe_metrics_cfg and moe_metrics_cfg.get("enabled", False):
+            from nemo_automodel.components.moe.load_balance_metrics import enable_load_balance_tracking
+
+            for mp in self.model_parts:
+                enable_load_balance_tracking(mp)
+
+        self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
+
+        # NEFTune: noisy embeddings for improved instruction fine-tuning
+        neftune_cfg = self.cfg.get("neftune", None)
+        self.neftune = None
+        if neftune_cfg is not None:
+            from nemo_automodel.components.training.neftune import NEFTune
+
+            noise_alpha = neftune_cfg.get("noise_alpha", 5.0) if hasattr(neftune_cfg, "get") else neftune_cfg
+            self.neftune = NEFTune(noise_alpha=float(noise_alpha))
+            self.neftune.activate(self.model_parts[0])
+
+        restore_from = self.cfg.get("checkpoint.restore_from", None)
+        # Initialize JSONL loggers
+        self.metric_logger_train = build_metric_logger(
+            pathlib.Path(self.checkpointer.config.checkpoint_dir) / "training.jsonl"
+        )
+        self.metric_logger_valid = {
+            name: build_metric_logger(
+                pathlib.Path(self.checkpointer.config.checkpoint_dir)
+                / (f"validation_{name}.jsonl" if name != "default" else "validation.jsonl")
+            )
+            for name in self.val_dataloaders.keys()
+        }
+
+        # Optionally resume
+        self.load_checkpoint(restore_from)
+        torch.cuda.empty_cache()
+
+        # Log step scheduler details
+        self._log_step_scheduler_details(self.step_scheduler)
+
+    def _collect_moe_load_balance(self):
+        """Collect MoE load balance metrics with DP all-reduce.
+
+        Must be called on ALL ranks (the all-reduce is collective).
+        Stores the result in ``self._moe_layer_loads`` for rank-0 logging.
+        """
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        if not (moe_metrics_cfg and moe_metrics_cfg.get("enabled", False)):
+            self._moe_layer_loads = None
+            return
+
+        from nemo_automodel.components.moe.load_balance_metrics import collect_expert_loads
+
+        dp_group = self._get_dp_group(include_cp=True)
+        all_loads: dict = {}
+        for mp in self.model_parts:
+            all_loads.update(collect_expert_loads(mp, dp_group=dp_group))
+        self._moe_layer_loads = all_loads if all_loads else None
+
+    def _log_moe_metrics(self, step: int, wandb_log_fn) -> None:
+        """Log MoE load balance metrics to wandb.
+
+        Call after :meth:`_collect_moe_load_balance`.  Only logs when
+        ``_moe_layer_loads`` is populated and a wandb log function is provided.
+
+        Args:
+            step: Current training/benchmark step for wandb x-axis.
+            wandb_log_fn: Callable like ``wandb.log`` or ``wandb_run.log``.
+        """
+        if not getattr(self, "_moe_layer_loads", None):
+            return
+
+        from nemo_automodel.components.moe.load_balance_metrics import (
+            compute_brief_metrics,
+            compute_detailed_metrics,
+        )
+
+        moe_metrics_cfg = self.cfg.get("moe_metrics", None)
+        mode = moe_metrics_cfg.get("mode", "brief") if moe_metrics_cfg else "brief"
+        top_k = moe_metrics_cfg.get("top_k_experts", 0) if moe_metrics_cfg else 0
+        if mode == "detailed":
+            detailed_every = moe_metrics_cfg.get("detailed_every_steps", None) if moe_metrics_cfg else None
+            if detailed_every is None or step % detailed_every == 0:
+                wandb_log_fn(compute_detailed_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+            else:
+                wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+        else:
+            wandb_log_fn(compute_brief_metrics(self._moe_layer_loads, top_k=top_k), step=step)
+
+    def _configure_pipeline_loss_fn(self):
+        if self.pp is None or not self.pp.info.has_last_stage:
+            return
+
+        last_stage_model = None
+        for model_part, stage in zip(self.model_parts, self.pp.info.stages):
+            if stage.is_last:
+                last_stage_model = model_part
+                break
+        if last_stage_model is None:
+            raise RuntimeError("Pipeline reports a last stage, but no last-stage model part was found")
+
+        # FusedLinearCrossEntropy consumes hidden states: flag the last stage to emit them
+        if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+            last_stage_model._pp_return_hidden_states = True
+
+        self.pp.info.schedule._loss_fn = self.cfg.mtp.build(self.loss_fn, last_stage_model)
+
+    def _setup_qat(self, cfg, model_parts: list[nn.Module]):
+        if not cfg.get("qat.enabled", False):
+            return None, None, None
+        from nemo_automodel.components.quantization.qat import (
+            get_disable_fake_quant_fn,
+            get_enable_fake_quant_fn,
+        )
+
+        qat_cfg = cfg.qat
+        _qat_enable_after = qat_cfg.get("fake_quant_after_n_steps", 0)
+        # Collect mode from any model part that has it
+        qat_mode = getattr(model_parts[0], "_qat_mode", None)
+
+        if qat_mode is None:
+            return None, None, None
+
+        _qat_disable_fn = get_disable_fake_quant_fn(qat_mode)
+        _qat_enable_fn = get_enable_fake_quant_fn(qat_mode)
+        if _qat_disable_fn is not None and _qat_enable_after is not None:
+            try:
+                # start with fake-quant disabled, will enable later
+                for part in model_parts:
+                    _qat_disable_fn(part)
+                logger.info("QAT fake-quant disabled initially; will enable after %s steps", _qat_enable_after)
+            except Exception as e:
+                logger.warning("Failed to disable fake-quant at setup: %s", e)
+        return _qat_disable_fn, _qat_enable_fn, _qat_enable_after
+
+    def _enable_qat_if_delayed(self, step: int):
+        if getattr(self, "_qat_enable_after", None) is None:
+            return
+        if step < self._qat_enable_after or self._qat_enable_fn is None:
+            return
+        try:
+            for mp in self.model_parts:
+                self._qat_enable_fn(mp)
+            logger.info("Enabled QAT fake-quant after step %s", step)
+            # Enable one
+            self._qat_enable_after = None
+        except Exception as e:
+            logger.warning("Failed to enable fake-quant: %s", e)
+
+    # ------------------ main loop ------------------
+    def run_train_validation_loop(self):
+        """Run the training loop over all epochs and batches.
+
+        For each batch, perform a forward pass, compute loss, backpropagate,
+        and update model parameters when necessary. Also prints loss every gradient step.
+        """
+        for mp in self.model_parts:
+            mp.train()
+        self.timestamp = time.perf_counter()
+
+        pbar = self._make_progress_bar()
+        try:
+            for epoch in self.step_scheduler.epochs:
+                self.step_scheduler.set_epoch(epoch)
+                # The step scheduler yields a list of batches with the following properties:
+                # 1. len(batches) == grad_acc_steps
+                # 2. len(batches[0]) == batch_size
+                for batches in self.step_scheduler:
+                    # If QAT delayed fake-quant is configured, enable after threshold
+                    self._enable_qat_if_delayed(self.step_scheduler.step)
+                    train_log_data = self._run_train_optim_step(batches, self.max_grad_norm)
+                    # Collect MoE load balance metrics (all ranks participate in all-reduce)
+                    self._collect_moe_load_balance()
+                    # log
+                    self.log_train_metrics(train_log_data)
+                    self._update_progress_bar(pbar, train_log_data.metrics)
+
+                    # Run validation every val_every_steps
+                    val_losses = {}
+                    if self.step_scheduler.is_val_step:
+                        for val_name, val_dataloader in self.val_dataloaders.items():
+                            val_log_data = self._run_validation_epoch(val_dataloader)
+                            val_losses[val_name] = val_log_data.metrics["val_loss"]
+                            self.log_val_metrics(val_name, val_log_data, self.metric_logger_valid[val_name])
+                        for mp in self.model_parts:
+                            mp.train()
+
+                    # Save the checkpoint every ckpt_every_steps
+                    if self.step_scheduler.is_ckpt_step:
+                        self.save_checkpoint(
+                            epoch,
+                            self.step_scheduler.step,
+                            train_log_data.metrics["loss"],
+                            val_losses,
+                            best_metric_key=self.best_metric_key,
+                        )
+                    self._maybe_collect_garbage()
+        finally:
+            if pbar is not None:
+                pbar.close()
+        # Close JSONL loggers after training loop completes
+        self.metric_logger_train.close()
+        for v in self.metric_logger_valid.values():
+            v.close()
+
+        self._finalize_and_close_checkpointer()
+
+        # Mark the MLflow run KILLED if training exited via SIGTERM.
+        if self.step_scheduler.sigterm_flag:
+            end_mlflow_active_run_as_killed()
+
+    # ------------------ helpers ------------------
+    def _forward_backward_step(
+        self,
+        idx,
+        batch,
+        *,
+        loss_buffer,
+        num_label_tokens,
+        num_batches,
+        is_train: bool = True,
+    ):
+        # Move batch to device (handle both tensors and dicts of tensors like causal_mask_mapping)
+        batch = {
+            k: (
+                {dk: dv.to(self.dist_env.device, non_blocking=True) for dk, dv in v.items() if dv is not None}
+                if isinstance(v, dict)
+                else (v.to(self.dist_env.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+            )
+            for k, v in batch.items()
+        }
+        cp_sharder = ContextParallelSharder(
+            self.model_parts[0] if hasattr(self, "model_parts") else None,
+            self.device_mesh,
+            batch,
+            padding_token_id=self.tokenizer.pad_token_id if self.tokenizer else 0,
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1,
+        )
+        train_ctx, batch = cp_sharder.shard(batch)
+        labels = batch.pop("labels")
+        fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
+
+        if self.pp_enabled:
+            with train_ctx(), fp8_ctx:
+                losses = [] if self.pp.info.has_last_stage else None
+                if self.pp.info.has_last_stage:
+                    masked_labels = labels.clone()
+                    targets = masked_labels
+                else:
+                    targets = None
+
+                input_ids = batch.pop("input_ids")
+
+                # Update PP stage shapes for the current batch's seq_len.
+                # This is a no-op when the length hasn't changed.
+                self.pp.update_seq_len(input_ids.shape[1])
+
+                # Filter out None values and empty dicts from batch to avoid PP chunking errors
+                batch_filtered = {
+                    k: v for k, v in batch.items() if v is not None and not (isinstance(v, dict) and len(v) == 0)
+                }
+                # Hand the THD ``cu_seqlens`` to the PP loss to mask cross-sequence boundaries —
+                # the fallback when the model emits no per-microbatch seq_idx tail (which the loss
+                # prefers). One cu_seqlens encodes a single shared layout, so it is only correct at
+                # one pack/microbatch per step; the seq_idx tail handles differing per-microbatch boundaries.
+                cu_seqlens = batch_filtered.get("cu_seqlens")
+                if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.dim() == 2:
+                    cu_seqlens = cu_seqlens.squeeze(0)  # [1, T] -> [T]
+                pp_loss_fn = getattr(self.pp.info.schedule, "_loss_fn", None) if self.pp.info.has_last_stage else None
+                if pp_loss_fn is not None and hasattr(pp_loss_fn, "cu_seqlens"):
+                    pp_loss_fn.cu_seqlens = cu_seqlens
+                if is_train:
+                    # Use step for training (forward + backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.step(input_ids, target=targets, losses=losses, **batch_filtered)
+                    else:
+                        self.pp.info.schedule.step(target=targets, losses=losses, **batch_filtered)
+                else:
+                    # Use eval for validation (forward only, no backward)
+                    if self.pp.info.has_first_stage:
+                        self.pp.info.schedule.eval(input_ids, target=targets, losses=losses, **batch_filtered)
+                    else:
+                        self.pp.info.schedule.eval(target=targets, losses=losses, **batch_filtered)
+
+            if self.pp.info.has_last_stage:
+                local_loss = torch.sum(torch.stack(losses))
+            else:
+                local_loss = torch.tensor(0.0, device=self.dist_env.device)
+
+            loss_buffer.append(local_loss.clone().detach())
+        else:
+            model = self.model_parts[0]
+            sync_ctx = (
+                get_sync_ctx(
+                    model,
+                    idx == num_batches - 1,
+                    defer_fsdp_grad_sync=getattr(self.distributed_config, "defer_fsdp_grad_sync", True),
+                )
+                if is_train
+                else nullcontext()
+            )
+            with train_ctx(), sync_ctx, fp8_ctx:
+                batch = filter_forward_kwargs(model, batch)
+                if isinstance(self.loss_fn, FusedLinearCrossEntropy):
+                    # use num_logits_to_keep to avoid full logits matrix in memory
+                    out = model(logits_to_keep=1, **batch)
+                    if "hidden_states" not in out:
+                        raise ValueError(
+                            "FusedLinearCrossEntropy requires the model to output hidden states. Set `model.output_hidden_states=True` in the config."
+                        )
+                else:
+                    out = model(**batch)
+
+                # Gather the LM head once and share it across the main loss and
+                # all MTP depths (FusedLinearCrossEntropy path) to avoid redundant
+                # full_tensor() gathers that accumulate on-device and OOM.
+                shared_lm_weight = (
+                    _get_lm_head_weight(model) if isinstance(self.loss_fn, FusedLinearCrossEntropy) else None
+                )
+                local_loss = calculate_loss(
+                    self.loss_fn,
+                    logits=getattr(out, "logits", out),
+                    labels=labels,
+                    model=model,
+                    hidden_states=get_final_hidden_states(out),
+                    lm_weight=shared_lm_weight,
+                    num_label_tokens=num_label_tokens,
+                )
+                mtp_per_depth_h = getattr(out, "mtp_per_depth_h", None)
+                mtp_per_depth_logits = getattr(out, "mtp_per_depth_logits", None)
+                if mtp_per_depth_h is not None or mtp_per_depth_logits is not None:
+                    mtp_cfg = self.cfg.mtp
+                    scaling_factor = (
+                        mtp_cfg.scaling_factor if mtp_cfg.scaling_factor is not None else out.mtp_loss_scaling_factor
+                    )
+                    local_loss = local_loss + calculate_mtp_loss(
+                        self.loss_fn,
+                        mtp_per_depth_h=mtp_per_depth_h,
+                        mtp_per_depth_logits=mtp_per_depth_logits,
+                        labels=labels,
+                        model=model,
+                        scaling_factor=scaling_factor,
+                        num_label_tokens=num_label_tokens,
+                        ignore_index=mtp_cfg.ignore_index,
+                        # mask cross-boundary MTP label rolls in THD packing (matches the PP path)
+                        cu_seqlens=batch.get("cu_seqlens"),
+                        lm_weight=shared_lm_weight,
+                    )
+                loss_buffer.append(local_loss.clone().detach())
+                if is_train:
+                    (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+
+    def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
+        pp_group = self.device_mesh["pp"].get_group()
+        pp_src_rank = torch.distributed.get_global_rank(pp_group, torch.distributed.get_world_size(pp_group) - 1)
+        torch.distributed.broadcast(tensor, src=pp_src_rank, group=pp_group)
+        return tensor
+
+    def _run_train_optim_step(self, batches, max_grad_norm: Optional[float] = None):
+        """Execute a single training step.
+
+        Args:
+            batches: List of batches of training data.
+            max_grad_norm: Gradient clipping norm. Optional, if None will not clip gradients.
+        """
+
+        num_label_tokens = torch.tensor(
+            sum((batch["labels"] != -100).sum().item() for batch in batches), dtype=torch.long
+        )
+        num_label_tokens = self._dp_allreduce(num_label_tokens).item()
+
+        # MoE aux loss gradients are injected via MoEAuxLossAutoScaler, which
+        # multiplies them by main_loss_backward_scale during backward.  This
+        # counteracts the unwanted scaling that FSDP and PP post-hoc rescaling
+        # apply to *all* gradients (including aux loss):
+        #
+        #   Non-PP: FSDP allreduce divides grads by dp_group_size.
+        #           Scale = dp_group_size  →  net = 1.
+        #
+        #   PP:     FSDP divides by dp_group_size, then
+        #           scale_grads_and_clip_grad_norm divides by
+        #           (num_label_tokens / dp_group_size).  The dp_group_size
+        #           factors cancel, leaving net 1/num_label_tokens.
+        #           Scale = num_label_tokens  →  net = 1.
+        if self.pp_enabled:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(float(num_label_tokens))
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                float(self._get_dp_group_size(include_cp=True))
+            )
+
+        loss_buffer = []
+
+        # number of tokens in the batch, excluding any tail padding.
+        num_tokens_in_batch = torch.tensor(
+            sum(batch["labels"].numel() - count_tail_padding(batch["labels"]) for batch in batches),
+            dtype=torch.long,
+        )
+        num_tokens_in_batch = self._dp_allreduce(num_tokens_in_batch).item()
+
+        num_batches = len(batches)
+        prepare_for_grad_accumulation(self.model_parts, pp_enabled=self.pp_enabled)
+
+        for i, batch in enumerate(batches):
+            if i == num_batches - 1:
+                prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
+
+            self._forward_backward_step(
+                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+            )
+
+            if i == 0:
+                prepare_after_first_microbatch()
+
+        grad_norm = scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            self.model_parts,
+            norm_type=2.0,
+            pp_enabled=self.pp_enabled,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep" if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names else None,
+            pp_axis_name="pp" if self.pp_enabled else None,
+            foreach=True,
+            num_label_tokens=num_label_tokens,
+            dp_group_size=self._get_dp_group_size(include_cp=True),
+            expert_tp_replication_factor=get_expert_tp_replication_factor(self.model_parts, self.device_mesh),
+        )
+
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
+        # self.model_parts[0].finish_grad_sync()
+
+        self.checkpointer.maybe_wait_for_staging()
+        for opt in self.optimizer:
+            opt.step()
+            opt.zero_grad()
+
+        if hasattr(self.model_parts[0], "update_moe_gate_bias"):
+            for mp in self.model_parts:
+                mp.update_moe_gate_bias()
+
+        if self.lr_scheduler is not None:
+            for scheduler in self.lr_scheduler:
+                scheduler.step(1)
+
+        # Precompute FP8 scales
+        fp8_config = self.cfg.get("fp8", None)
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled", False)
+            and fp8_config.get("precompute_float8_dynamic_scale_for_fsdp", False)
+            and not self.pp_enabled
+            and self.device_mesh is not None
+            and self.device_mesh["dp_shard"].size() > 1
+        ):
+            precompute_float8_dynamic_scale_for_fsdp(self.model_parts[0])
+
+        # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
+        # self.model_parts[0].install_optimized_model_weights()
+        # self.model_parts[0].zero_grad_buffer()
+
+        t = time.perf_counter()
+        time_delta = t - self.timestamp
+        self.timestamp = t
+        tps = num_tokens_in_batch / time_delta
+
+        mfu = None
+        mfu_calculator = getattr(self, "mfu_calculator", None)
+        if batches and mfu_calculator is not None:
+            step_flops = 0.0
+            flops_supported = True
+            for batch in batches:
+                input_ids = batch.get("input_ids")
+                if input_ids is None:
+                    flops_supported = False
+                    break
+                batch_flops = mfu_calculator.get_flops(input_ids)
+                if batch_flops is None:
+                    flops_supported = False
+                    break
+                step_flops += float(batch_flops)
+
+            if flops_supported:
+                step_flops = self._dp_allreduce(
+                    torch.tensor(step_flops, dtype=torch.float64, device=self.dist_env.device), include_cp=True
+                ).item()
+                mfu = calculate_mfu(step_flops / 1e12, self.dist_env.world_size, time_delta)
+
+        reporting_loss = torch.sum(torch.stack(loss_buffer))
+        reporting_loss = self._dp_allreduce(reporting_loss, include_cp=True)
+        if self.pp_enabled:
+            reporting_loss = reporting_loss / num_label_tokens
+            reporting_loss = reporting_loss.to(self.dist_env.device)
+            reporting_loss = self._broadcast_from_last_pp_stage(reporting_loss)
+
+        reporting_loss = reporting_loss.cpu().item()
+        # fix reporting_loss, tps across ranks
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics={
+                "loss": reporting_loss,
+                "grad_norm": grad_norm,
+                "lr": self.optimizer[0].param_groups[0]["lr"],
+                "mem": torch.cuda.max_memory_allocated() / 1024**3,
+                "tps": tps,
+                "tps_per_gpu": tps / self._get_cp_group_size() / max(self._get_dp_group_size(), 1),
+                "mfu": mfu,
+                "num_tokens_per_step": num_tokens_in_batch,
+                "num_label_tokens": num_label_tokens,
+            },
+        )
+
+    @torch.no_grad()
+    def _run_validation_epoch(self, val_dataloader):
+        """Run one pass over a single validation dataloader.
+
+        Args:
+            val_name: Name of the validation dataset.
+            val_dataloader: DataLoader for the validation dataset.
+        """
+        with ScopedRNG(seed=1, ranked=True):
+            for mp in self.model_parts:
+                mp.eval()
+
+            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            total_num_label_tokens = 0
+
+            for batch in val_dataloader:
+                loss_buffer = []
+                num_label_tokens = (batch["labels"] != -100).sum().item()
+                self._forward_backward_step(
+                    0,
+                    batch,
+                    loss_buffer=loss_buffer,
+                    num_label_tokens=None,  # we will normalize outside.
+                    num_batches=1,
+                    is_train=False,
+                )
+
+                total_loss += torch.sum(torch.stack(loss_buffer)).item()
+                total_num_label_tokens += num_label_tokens
+
+        total_loss = self._dp_allreduce(total_loss, include_cp=True)
+        total_num_label_tokens = self._dp_allreduce(
+            torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+        ).item()
+        val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+
+        # For PP, send val_loss and num_label_tokens from last stage to main rank
+        if self.pp_enabled:
+            val_loss = val_loss.to(self.dist_env.device)
+            # On non-last ranks total_num_label_tokens is 0; this tensor is just a recv buffer.
+            pp_num_tokens = torch.tensor(total_num_label_tokens, dtype=torch.long, device=self.dist_env.device)
+            val_loss = self._broadcast_from_last_pp_stage(val_loss)
+            pp_num_tokens = self._broadcast_from_last_pp_stage(pp_num_tokens)
+            if self.dist_env.is_main:
+                total_num_label_tokens = pp_num_tokens.item()
+
+        val_loss = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
+
+        metrics = {
+            "val_loss": val_loss,
+            "lr": self.optimizer[0].param_groups[0]["lr"],
+            "num_label_tokens": total_num_label_tokens,
+            "mem": torch.cuda.max_memory_allocated() / 1024**3,
+        }
+
+        # Tool-call accuracy is the only signal that catches "loss going
+        # down because format was learned but the model picks wrong tools".
+        # Generation on an FSDP2 training model is intentionally opt-in:
+        # generate() repeatedly unshards parameters and can leave enough
+        # allocator pressure to OOM the next backward pass.
+        if getattr(self, "tool_call_evaluator", None) is not None:
+            prefix = self.tool_call_evaluator.metric_prefix
+            count_key = f"{prefix}/_count"
+            if isinstance(self.distributed_config, FSDP2Config) and not getattr(
+                self.tool_call_evaluator, "run_on_fsdp2", False
+            ):
+                if not self._warned_tool_call_eval_skipped:
+                    logging.warning(
+                        "Skipping tool_call_evaluator during FSDP2 training. "
+                        "Set tool_call_eval.run_on_fsdp2=true to force in-loop generation, "
+                        "or run the evaluator offline from a checkpoint."
+                    )
+                    self._warned_tool_call_eval_skipped = True
+                metrics[f"{prefix}/_disabled_fsdp2"] = 1.0
+            else:
+                # sample_shard is set (identically) on every rank only for DDP,
+                # where each rank scored a DISJOINT subset → all-reduce. When it
+                # is None (FSDP2 in-loop, or single rank) every rank scored the
+                # SAME set in lockstep and holds identical results → use them
+                # directly with no collective. The branch is taken identically on
+                # all ranks, so the collectives below stay in sync.
+                sharded = self.tool_call_evaluator.sample_shard is not None
+                try:
+                    local_metrics = self.tool_call_evaluator.evaluate(self.model_parts[0], self.tokenizer)
+                except Exception as exc:
+                    logging.warning("tool_call_evaluator.evaluate failed: %s", exc)
+                    local_metrics = {}
+
+                metric_keys = list(self.tool_call_evaluator.METRIC_KEYS)
+                local_count = float(local_metrics.get(count_key, 0.0))
+                if sharded:
+                    # Every DP rank must issue the SAME collective here, whatever
+                    # its local eval produced. A rank whose evaluate() raised (e.g.
+                    # a divergent generate() OOM) or that hit different skip reasons
+                    # must not skip or add an all-reduce, or it desyncs the
+                    # collective and deadlocks the others. So reduce a FIXED vector
+                    # (count, count-weighted means, skipped — never the per-rank
+                    # _skip_<reason> keys) in one packed all-reduce; a local failure
+                    # contributes zeros but still participates.
+                    packed = torch.tensor(
+                        [local_count]
+                        + [float(local_metrics.get(f"{prefix}/{k}", 0.0)) * local_count for k in metric_keys]
+                        + [float(local_metrics.get(f"{prefix}/_skipped", 0.0))],
+                        dtype=torch.float32,
+                        device=self.dist_env.device,
+                    )
+                    reduced = self._dp_allreduce(packed).tolist()
+                    total_count = reduced[0]
+                    for i, k in enumerate(metric_keys, start=1):
+                        metrics[f"{prefix}/{k}"] = reduced[i] / total_count if total_count > 0 else 0.0
+                    metrics[f"{prefix}/_skipped"] = reduced[-1]
+                    metrics[count_key] = total_count
+                else:
+                    # Replicated: identical on every rank, so report the local
+                    # values directly (no collective, _count is the true count).
+                    for k in metric_keys:
+                        metrics[f"{prefix}/{k}"] = float(local_metrics.get(f"{prefix}/{k}", 0.0))
+                    metrics[f"{prefix}/_skipped"] = float(local_metrics.get(f"{prefix}/_skipped", 0.0))
+                    metrics[count_key] = local_count
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        return MetricsSample(
+            step=self.step_scheduler.step,
+            epoch=self.step_scheduler.epoch,
+            metrics=metrics,
+        )
+
+    def log_val_metrics(self, val_name, log_data, metric_logger=None):
+        """Log metrics to wandb, MLflow and other loggers
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "val_loss": Validation loss.
+                    "lr": Learning rate.
+                    "num_label_tokens": Number of label tokens.
+                    "mem": Memory allocated.
+        """
+
+        if not self.dist_env.is_main or log_data is None:
+            return
+
+        if wandb.run is not None:
+            if val_name == "default":
+                wandb.log(log_data.metrics, step=log_data.step)
+            else:
+                metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
+                wandb.log(metrics, step=log_data.step)
+
+        if mlflow.active_run() is not None:
+            mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+
+        if self.comet_logger is not None:
+            self.comet_logger.log_metrics(log_data.to_dict() | {"val_name": val_name}, step=log_data.step)
+
+        # JSONL validation log
+        if not metric_logger is None:
+            metric_logger.log(log_data)
+
+        tool_call_suffix = ""
+        if "tool_call/_count" in log_data.metrics:
+            tool_call_suffix = (
+                " | tool_name_acc {:.3f} | args_json_valid {:.3f} | args_exact_match {:.3f} (n={})".format(
+                    log_data.metrics.get("tool_call/name_correct", 0.0),
+                    log_data.metrics.get("tool_call/args_json_valid", 0.0),
+                    log_data.metrics.get("tool_call/args_exact_match", 0.0),
+                    int(log_data.metrics.get("tool_call/_count", 0)),
+                )
+            )
+        logging.info(
+            '[val] name "{}" | step {} | epoch {} | loss {:.4f} | lr {:.2e} | num_label_tokens {}{}'.format(
+                val_name,
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["val_loss"],
+                log_data.metrics["lr"],
+                log_data.metrics["num_label_tokens"],
+                tool_call_suffix,
+            )
+        )
+
+    def log_train_metrics(self, log_data):
+        """Log metrics to wandb and other loggers.
+
+        Args:
+            log_data: MetricsSample object, containing:
+                step: int, the current step.
+                epoch: int, the current epoch.
+                metrics: Dict[str, float], containing:
+                    "loss": Training loss.
+                    "grad_norm": Grad norm from the training step.
+                    "lr": Learning rate.
+                    "mem": Memory allocated.
+                    "tps": Tokens per second.
+                    "tps_per_gpu": Tokens per second per GPU.
+                    "num_label_tokens": Number of label tokens.
+        """
+        if not self.dist_env.is_main:
+            return
+
+        # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if mlflow.active_run() is not None:
+                mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
+            if self.comet_logger is not None:
+                self.comet_logger.log_metrics(log_data.to_dict(), step=log_data.step)
+
+        # Log MoE load balance metrics (already collected/reduced on all ranks)
+        if self.step_scheduler.is_remote_logging_step:
+            if wandb.run is not None:
+                self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+            if self.comet_logger is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)
+                )
+            if mlflow.active_run() is not None:
+                self._log_moe_metrics(
+                    self.step_scheduler.step, lambda m, step: mlflow.log_metrics(to_float_metrics(m), step=step)
+                )
+
+        # JSONL training log (always log for detailed local records)
+        self.metric_logger_train.log(log_data)
+        logging.info(
+            "step {} | epoch {} | loss {:.4f} | grad_norm {:.4f} | lr {:.2e} | mem {:.2f} GiB | tps {:.2f}({:.2f}/gpu) | num_label_tokens {}".format(
+                log_data.step,
+                log_data.epoch,
+                log_data.metrics["loss"],
+                log_data.metrics["grad_norm"],
+                log_data.metrics["lr"],
+                log_data.metrics["mem"],
+                log_data.metrics["tps"],
+                log_data.metrics["tps_per_gpu"],
+                log_data.metrics["num_label_tokens"],
+            )
+        )
+        torch.cuda.reset_peak_memory_stats()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main(config_path=None):
+    """Main entry point for the fine-tuning recipe.
+
+    Loads the configuration, sets up the trainer, and initiates the training loop.
+    """
+    if config_path is None:
+        config_path = pathlib.Path(__file__).parent.resolve() / "llama_3_2_1b_hellaswag.yaml"
+    cfg = parse_args_and_load_config(config_path)
+    trainer = TrainFinetuneRecipeForNextTokenPrediction(cfg)
+    trainer.setup()
+    trainer.run_train_validation_loop()
+
+
+if __name__ == "__main__":
+    main()
