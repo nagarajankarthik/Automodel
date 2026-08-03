@@ -49,6 +49,8 @@ _nvshmem_available = None
 _uccl_buffer = None
 
 
+# TODO (NK): Revert the changes in this file indicated with 'NK modification' after upgrading the DeepEP version.
+
 def _is_nvshmem_available() -> bool:
     """Check if DeepEP was compiled with NVSHMEM support.
 
@@ -57,7 +59,9 @@ def _is_nvshmem_available() -> bool:
     """
     global _nvshmem_available
     if _nvshmem_available is None:
-        _nvshmem_available = Buffer.is_sm90_compiled()
+        #NK modification
+        # _nvshmem_available = Buffer.is_sm90_compiled()
+        _nvshmem_available = True
     return _nvshmem_available
 
 
@@ -114,7 +118,9 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         # ``_buffer.destroy()`` (see free_buffer()). Without an explicit teardown the DeepEP
         # state lingers on the GPUs for the lifetime of the process / Slurm allocation and
         # corrupts later forwards (e.g. a checkpoint-robustness HF reload after training).
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, explicitly_destroy=True)
+        # NK modification
+        # _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, explicitly_destroy=True)
+        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer
 
 
