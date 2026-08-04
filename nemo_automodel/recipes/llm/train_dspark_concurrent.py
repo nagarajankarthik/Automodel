@@ -507,21 +507,8 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
             )
 
         # training only the backbone, fc, Markov head, and confidence head.
-        if embed_src is None or head_src is None:
-            embed_src = self.target_wrapper.get_input_embeddings()
-            head_src = self.target_wrapper.get_output_embeddings()
-        if self.distributed_setup is not None:
-            # Every distributed-setup-loaded target (MoE / VL / sharded dense) stores
-            # embed_tokens / lm_head as expert-parallel / FSDP-sharded DTensors; gather
-            # them to full tensors before the draft copies them. The offline cached path
-            # never builds a distributed setup, so it is excluded by construction.
-            embed_src = gather_full_weight_module(embed_src)
-            head_src = gather_full_weight_module(head_src)
-        self.draft_model.initialize_embeddings_and_head(
-            embed_tokens=embed_src,
-            lm_head=head_src,
-            freeze=bool(recipe_cfg.get("freeze_embeddings", True)),
-        )
+        # Under this code path, the target's embeddings and lm_head wights 
+        # will be copied to the draft later.
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the FSDP2/DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
@@ -605,13 +592,10 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         self.defer_fsdp_grad_sync = bool(dist_cfg.get("defer_fsdp_grad_sync", True)) if dist_cfg is not None else True
         self.metric_logger = build_metric_logger(str(self.output_dir / "dspark_train_metrics.jsonl"))
 
-        try:
-            num_batches_per_epoch = len(self.train_dataloader)
-        except TypeError:
-            num_batches_per_epoch = 0
-        total_optim_steps = max(
-            1, self.num_epochs * optim_steps_per_epoch(num_batches_per_epoch, self.grad_accumulation_steps)
-        )
+        # TODO: For concurrent training, the DSpark module doesn't need its own dataloader.
+        # However, the user should have the option to specify a separate lr_scheduler and 
+        # optimizer for the DSpark module.
+        total_optim_steps = opt_cfg.get("total_steps", 1)
         warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
         min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
         warmup_steps = _resolve_warmup_steps(warmup_ratio, total_optim_steps)
