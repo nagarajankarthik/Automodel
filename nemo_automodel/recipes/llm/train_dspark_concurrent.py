@@ -509,6 +509,8 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # training only the backbone, fc, Markov head, and confidence head.
         # Under this code path, the target's embeddings and lm_head wights 
         # will be copied to the draft later.
+        # The draft's embedding and lm_head are still frozen here.
+        self.draft_model.set_embedding_head_trainable(False)
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede AC and the FSDP2/DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
         # Optional torch.compile of the draft, in place; after the fp8 swap.
