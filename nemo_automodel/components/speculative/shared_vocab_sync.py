@@ -30,12 +30,18 @@ class SharedVocabSync:
         self.model_parts = model_parts
         self.mesh_context = mesh_context
         self.device_mesh = mesh_context.device_mesh
-        self.pp_mesh = get_flat_mesh(self.device_mesh, "pp")
+        pp_mesh = get_flat_mesh(self.device_mesh, "pp")
+        self.pp_group = pp_mesh.get_group()
+        self.pp_degree = mesh_context.pp_size()
         self.draft_model = draft_model
         self.embedding = None
         self.lm_head = None
-        self._discover_embedding()
-        self._discover_lm_head()
+        if self.pp_degree > 1:
+            self._discover_embedding()
+            self._discover_lm_head()
+        else:
+            self.embedding = self.model_parts[0].get_input_embeddings()
+            self.lm_head = self.model_parts[0].get_output_embeddings()
 
     def _discover_embedding(self) -> None:
         """
@@ -53,8 +59,7 @@ class SharedVocabSync:
         has_embed = torch.tensor([int(has_embedding)], 
                                  dtype=torch.int32, 
                                  device=self.device_mesh.device)
-        pp_group = self.pp_mesh.get_group()
-        dist.all_reduce(has_embed, op=dist.ReduceOp.SUM, group=pp_group)
+        dist.all_reduce(has_embed, op=dist.ReduceOp.SUM, group=self.pp_group)
         assert has_embed[0] == 1, f"Expected only one rank to have an embedding layer per pipeline parallel process group, but found {has_embed[0]} such ranks."
 
         global_rank = dist.get_rank()
@@ -63,7 +68,7 @@ class SharedVocabSync:
             dtype=torch.long, 
             device="cuda"
         )
-        dist.all_reduce(src_tensor, op=dist.ReduceOp.MAX, group=pp_group)
+        dist.all_reduce(src_tensor, op=dist.ReduceOp.MAX, group=self.pp_group)
         self.embedding_src_rank = src_tensor.item()
         if self.embedding_src_rank == -1:
             raise RuntimeError("No sender rank identified for embedding layer.")
@@ -84,8 +89,7 @@ class SharedVocabSync:
         has_lm_head = torch.tensor([int(has_lm_head)], 
                                  dtype=torch.int32, 
                                  device=self.device_mesh.device)
-        pp_group = self.pp_mesh.get_group()
-        dist.all_reduce(has_lm_head, op=dist.ReduceOp.SUM, group=pp_group)
+        dist.all_reduce(has_lm_head, op=dist.ReduceOp.SUM, group=self.pp_group)
         assert has_lm_head[0] == 1, "Expected only one rank to have an lm_head layer per pipeline parallel process group, but found {has_lm_head[0]} such ranks."
         global_rank = dist.get_rank()
         src_tensor = torch.tensor(
@@ -93,7 +97,7 @@ class SharedVocabSync:
             dtype=torch.long, 
             device="cuda"
         )
-        dist.all_reduce(src_tensor, op=dist.ReduceOp.MAX, group=pp_group)
+        dist.all_reduce(src_tensor, op=dist.ReduceOp.MAX, group=self.pp_group)
         self.lm_head_src_rank = src_tensor.item()
         if self.lm_head_src_rank == -1:
             raise RuntimeError("No sender rank identified for lm_head layer.")
@@ -106,36 +110,41 @@ class SharedVocabSync:
         # Embeddings
         if copy_embedding:
             embed_tensor = self.embedding.weight.full_tensor() if self.embedding is not None else torch.zeros_like(self.draft_model.embed_tokens.weight)
-            dist.broadcast(embed_tensor, src=self.embedding_src_rank, group=self.pp_mesh.get_group())
+            if self.pp_degree > 1:
+                dist.broadcast(embed_tensor, src=self.embedding_src_rank, group=self.pp_group)
             _write_full_into_param(self.draft_model.embed_tokens.weight, embed_tensor)
             del embed_tensor
 
         # lm head
         if copy_lm_head:
             lm_head_tensor = self.lm_head.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.weight)
-            dist.broadcast(lm_head_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            if self.pp_degree > 1:
+                dist.broadcast(lm_head_tensor, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(self.draft_model.lm_head.weight, lm_head_tensor)
             del lm_head_tensor
 
         # Lora adapters
         if self.cfg.update_lm_head_adapters:
             lm_head_lora_A_tensor = self.lm_head.lora_A.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_A.weight)
-            dist.broadcast(lm_head_lora_A_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            if self.pp_degree > 1:
+                dist.broadcast(lm_head_lora_A_tensor, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(self.draft_model.lm_head.lora_A.weight, lm_head_lora_A_tensor)
             del lm_head_lora_A_tensor
             
             lm_head_lora_B_tensor = self.lm_head.lora_B.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_B.weight)
-            dist.broadcast(lm_head_lora_B_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            if self.pp_degree > 1:
+                dist.broadcast(lm_head_lora_B_tensor, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(self.draft_model.lm_head.lora_B.weight, lm_head_lora_B_tensor)
             del lm_head_lora_B_tensor
 
         if self.cfg.update_lm_head_dora:
             lm_head_lora_magnitude = self.lm_head.lora_magnitude.weight if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_magnitude.weight)
-            dist.broadcast(lm_head_lora_magnitude, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            if self.pp_degree > 1:
+                dist.broadcast(lm_head_lora_magnitude, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(self.draft_model.lm_head.lora_magnitude.weight, lm_head_lora_magnitude)
             del lm_head_lora_magnitude
 
-    def maybe_sync(self, step: int) -> None:
+    def maybe_sync(self, step:int) -> None:
         if step % self.cfg.sync_interval != 0:
             return
         self.capture(copy_embedding=self.cfg.update_embedding, copy_lm_head=self.cfg.update_lm_head)
