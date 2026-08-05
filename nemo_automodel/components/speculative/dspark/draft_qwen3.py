@@ -228,6 +228,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.lm_head_lora:
+            lora_func = config.lora_func
+            self.lm_head = lora_func(self.lm_head)
         self.block_size = int(config.block_size)
         self.mask_token_id = config.mask_token_id
         self.num_anchors = int(config.num_anchors)
