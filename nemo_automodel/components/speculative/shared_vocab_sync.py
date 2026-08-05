@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor, distribute_tensor
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 
 
@@ -41,6 +42,7 @@ class SharedVocabSync:
         Check if any model part on the current rank 
         has an embedding layer.
         """
+        has_embedding = False
         for mp in self.model_parts:
             embedding = mp.get_input_embeddings()
             if embedding is not None:
@@ -57,13 +59,25 @@ class SharedVocabSync:
                                  device=self.device_mesh.device)
         pp_group = self.pp_mesh.get_group()
         dist.all_reduce(has_embed, op=dist.ReduceOp.SUM, group=pp_group)
-        assert has_embed[0] == 1
+        assert has_embed[0] == 1, f"Expected only one rank to have an embedding layer per pipeline parallel process group, but found {has_embed[0]} such ranks."
+
+        global_rank = dist.get_rank()
+        src_tensor = torch.tensor(
+            [global_rank if has_embedding else -1], 
+            dtype=torch.long, 
+            device="cuda"
+        )
+        dist.all_reduce(src_tensor, op=dist.ReduceOp.MAX, group=pp_group)
+        self.embedding_src_rank = src_tensor.item()
+        if self.embedding_src_rank == -1:
+            raise RuntimeError("No sender rank identified for embedding layer.")
 
     def _discover_lm_head(self) -> None:
         """
         Check if any model part on the current rank 
         has an lm_head layer.
         """
+        has_lm_head = False
         for mp in self.model_parts:
             lm_head = mp.get_output_embeddings()
             if lm_head is not None:
@@ -80,11 +94,67 @@ class SharedVocabSync:
                                  device=self.device_mesh.device)
         pp_group = self.pp_mesh.get_group()
         dist.all_reduce(has_lm_head, op=dist.ReduceOp.SUM, group=pp_group)
-        assert has_embed[0] == 1
+        assert has_lm_head[0] == 1, "Expected only one rank to have an lm_head layer per pipeline parallel process group, but found {has_lm_head[0]} such ranks."
+        global_rank = dist.get_rank()
+        src_tensor = torch.tensor(
+            [global_rank if has_lm_head else -1], 
+            dtype=torch.long, 
+            device="cuda"
+        )
+        dist.all_reduce(src_tensor, op=dist.ReduceOp.MAX, group=pp_group)
+        self.lm_head_src_rank = src_tensor.item()
+        if self.lm_head_src_rank == -1:
+            raise RuntimeError("No sender rank identified for lm_head layer.")
 
-    
+
     def capture(self):
-        raise NotImplementedError
+        """
+        Copy embeddings, lm_head and lora adapters from the target to the draft model.
+        """
+        # Embeddings
+        embed_tensor = self.embedding.weight.full_tensor() if self.embedding is not None else torch.zeros_like(self.draft_model.embed_tokens.weight)
+        dist.broadcast(embed_tensor, src=self.embedding_src_rank, group=self.pp_mesh.get_group())
+        _write_full_into_param(self.draft_model.embed_tokens.weight, embed_tensor)
+        del embed_tensor
+
+        # lm head
+        lm_head_tensor = self.lm_head.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.weight)
+        dist.broadcast(lm_head_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+        _write_full_into_param(self.draft_model.lm_head.weight, lm_head_tensor)
+        del lm_head_tensor
+
+        # Lora adapters
+        if self._update_lm_head_adapters:
+            lm_head_lora_A_tensor = self.lm_head.lora_A.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_A)
+            dist.broadcast(lm_head_lora_A_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            _write_full_into_param(self.draft_model.lm_head.lora_A, lm_head_lora_A_tensor)
+            del lm_head_lora_A_tensor
+            
+            lm_head_lora_B_tensor = self.lm_head.lora_B.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_B)
+            dist.broadcast(lm_head_lora_B_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            _write_full_into_param(self.draft_model.lm_head.lora_B, lm_head_lora_B_tensor)
+            del lm_head_lora_B_tensor
+
+            lm_head_dora_magnitude = self.lm_head.dora_magnitude.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.dora_magnitude)
+            dist.broadcast(lm_head_dora_magnitude, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            _write_full_into_param(self.draft_model.lm_head.dora_magnitude, lm_head_dora_magnitude)
+            del lm_head_dora_magnitude
 
     def maybe_sync(self, step):
         raise NotImplementedError
+
+def _write_full_into_param(param: torch.nn.Parameter, full: torch.Tensor) -> None:
+    """Write a full tensor (identical on every rank) into a possibly-sharded param."""
+    with torch.no_grad():
+        if not isinstance(param, DTensor):
+            param.copy_(full)                     # ignored_params / unsharded case
+            return
+        # Read layout off the target — works for dp, or 2D HSDP placements, unchanged.
+        src = distribute_tensor(full.to(param.dtype), param.device_mesh, param.placements)
+        assert src.to_local().shape == param.to_local().shape, (
+                f"shard mismatch: {src.to_local().shape} vs {param.to_local().shape}"
+            )
+            param.copy_(src)                          # local-to-local; param object preserved
+
+
+    
