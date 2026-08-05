@@ -8,11 +8,15 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 
 @dataclass
 class SharedVocabSyncConfig:
-    sync_every_steps: int = 100
+    sync_interval: int = 100
+    update_embedding: bool = False
+    update_lm_head: bool = False
+    update_lm_head_adapters: bool = False
+    update_lm_head_dora: bool = False
 
     def build(self, *, model_parts, mesh_context, draft_model) -> "SharedVocabSync":
         sync = SharedVocabSync(self, model_parts, mesh_context, draft_model)
-        sync.capture()   # probe ownership, derive per-module sync policy
+        sync.capture(copy_embedding=True, copy_lm_head=True)
         return sync
 
 class SharedVocabSync:
@@ -28,10 +32,6 @@ class SharedVocabSync:
         self.device_mesh = mesh_context.device_mesh
         self.pp_mesh = get_flat_mesh(self.device_mesh, "pp")
         self.draft_model = draft_model
-        self._update_embedding = False
-        self._update_lm_head = False
-        self._update_embedding_adapters = False
-        self._update_lm_head_adapters = False
         self.embedding = None
         self.lm_head = None
         self._discover_embedding()
@@ -48,10 +48,6 @@ class SharedVocabSync:
             if embedding is not None:
                 has_embedding = True
                 self.embedding = embedding
-                # Embedding layers should not have lora adapters
-                # so we can just check if the embedding weight is trainable
-                if embedding.weight.requires_grad:
-                    self._update_embedding = True
                 break
         dist.barrier()
         has_embed = torch.tensor([int(has_embedding)], 
@@ -83,10 +79,6 @@ class SharedVocabSync:
             if lm_head is not None:
                 has_lm_head = True
                 self.lm_head = lm_head
-                if hasattr(lm_head, "lora_A"):
-                    self._update_lm_head_adapters = True
-                elif lm_head.weight.requires_grad:
-                    self._update_lm_head = True
                 break
         dist.barrier()
         has_lm_head = torch.tensor([int(has_lm_head)], 
@@ -107,24 +99,26 @@ class SharedVocabSync:
             raise RuntimeError("No sender rank identified for lm_head layer.")
 
 
-    def capture(self):
+    def capture(self, copy_embedding:bool=False, copy_lm_head:bool=False):
         """
         Copy embeddings, lm_head and lora adapters from the target to the draft model.
         """
         # Embeddings
-        embed_tensor = self.embedding.weight.full_tensor() if self.embedding is not None else torch.zeros_like(self.draft_model.embed_tokens.weight)
-        dist.broadcast(embed_tensor, src=self.embedding_src_rank, group=self.pp_mesh.get_group())
-        _write_full_into_param(self.draft_model.embed_tokens.weight, embed_tensor)
-        del embed_tensor
+        if copy_embedding:
+            embed_tensor = self.embedding.weight.full_tensor() if self.embedding is not None else torch.zeros_like(self.draft_model.embed_tokens.weight)
+            dist.broadcast(embed_tensor, src=self.embedding_src_rank, group=self.pp_mesh.get_group())
+            _write_full_into_param(self.draft_model.embed_tokens.weight, embed_tensor)
+            del embed_tensor
 
         # lm head
-        lm_head_tensor = self.lm_head.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.weight)
-        dist.broadcast(lm_head_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
-        _write_full_into_param(self.draft_model.lm_head.weight, lm_head_tensor)
-        del lm_head_tensor
+        if copy_lm_head:
+            lm_head_tensor = self.lm_head.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.weight)
+            dist.broadcast(lm_head_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            _write_full_into_param(self.draft_model.lm_head.weight, lm_head_tensor)
+            del lm_head_tensor
 
         # Lora adapters
-        if self._update_lm_head_adapters:
+        if self.cfg.update_lm_head_adapters:
             lm_head_lora_A_tensor = self.lm_head.lora_A.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_A.weight)
             dist.broadcast(lm_head_lora_A_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
             _write_full_into_param(self.draft_model.lm_head.lora_A.weight, lm_head_lora_A_tensor)
@@ -135,13 +129,16 @@ class SharedVocabSync:
             _write_full_into_param(self.draft_model.lm_head.lora_B.weight, lm_head_lora_B_tensor)
             del lm_head_lora_B_tensor
 
-            lm_head_dora_magnitude = self.lm_head.dora_magnitude.weight if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.dora_magnitude.weight)
-            dist.broadcast(lm_head_dora_magnitude, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
-            _write_full_into_param(self.draft_model.lm_head.dora_magnitude.weight, lm_head_dora_magnitude)
-            del lm_head_dora_magnitude
+        if self.cfg.update_lm_head_dora:
+            lm_head_lora_magnitude = self.lm_head.lora_magnitude.weight if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_magnitude.weight)
+            dist.broadcast(lm_head_lora_magnitude, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
+            _write_full_into_param(self.draft_model.lm_head.lora_magnitude.weight, lm_head_lora_magnitude)
+            del lm_head_lora_magnitude
 
-    def maybe_sync(self, step):
-        raise NotImplementedError
+    def maybe_sync(self, step: int) -> None:
+        if step % self.cfg.sync_interval != 0:
+            return
+        self.capture(copy_embedding=self.cfg.update_embedding, copy_lm_head=self.cfg.update_lm_head)
 
 def _write_full_into_param(param: torch.nn.Parameter, full: torch.Tensor) -> None:
     """Write a full tensor (identical on every rank) into a possibly-sharded param."""
