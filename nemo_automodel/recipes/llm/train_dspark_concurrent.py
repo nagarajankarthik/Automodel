@@ -493,6 +493,8 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
             draft_config["confidence_head_with_markov"] = bool(recipe_cfg.get("confidence_head_with_markov", True))
         # The draft owns an independent (frozen) lm_head seeded from the target.
         draft_config["tie_word_embeddings"] = False
+        draft_config["lm_head_lora"] = recipe_cfg.get("lm_head_lora", True)
+        draft_config["lora_func"] = recipe_cfg.get("lora_func", None)
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
 
@@ -505,6 +507,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
                 f"Sequence packing (packed_sequence_size>0) is only supported by the Qwen3 DSpark draft, "
                 f"not {type(self.draft_model).__name__}."
             )
+
 
         # training only the backbone, fc, Markov head, and confidence head.
         # Under this code path, the target's embeddings and lm_head wights 
@@ -850,22 +853,6 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
     def _forward_batch(self, batch):
         """Run one batch through live target capture or the offline cache."""
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-        if self.target_wrapper is None:
-            batch["target_hidden_states"] = batch["target_hidden_states"].to(self.compute_dtype)
-            batch["target_last_hidden_states"] = batch["target_last_hidden_states"].to(self.compute_dtype)
-            return self.trainer_module(
-                input_ids=batch["input_ids"],
-                target_hidden_states=batch["target_hidden_states"],
-                loss_mask=batch["loss_mask"],
-                target_last_hidden_states=batch["target_last_hidden_states"],
-            )
-        target_batch = self.target_wrapper.generate_batch(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            loss_mask=batch["loss_mask"],
-            **_packing_kwargs(batch),
-            **_extract_mm_kwargs(batch),
-        )
         return self.trainer_module(
             input_ids=target_batch.input_ids,
             target_hidden_states=target_batch.target_hidden_states,
