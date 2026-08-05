@@ -125,19 +125,19 @@ class SharedVocabSync:
 
         # Lora adapters
         if self._update_lm_head_adapters:
-            lm_head_lora_A_tensor = self.lm_head.lora_A.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_A)
+            lm_head_lora_A_tensor = self.lm_head.lora_A.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_A.weight)
             dist.broadcast(lm_head_lora_A_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
-            _write_full_into_param(self.draft_model.lm_head.lora_A, lm_head_lora_A_tensor)
+            _write_full_into_param(self.draft_model.lm_head.lora_A.weight, lm_head_lora_A_tensor)
             del lm_head_lora_A_tensor
             
-            lm_head_lora_B_tensor = self.lm_head.lora_B.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_B)
+            lm_head_lora_B_tensor = self.lm_head.lora_B.weight.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.lora_B.weight)
             dist.broadcast(lm_head_lora_B_tensor, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
-            _write_full_into_param(self.draft_model.lm_head.lora_B, lm_head_lora_B_tensor)
+            _write_full_into_param(self.draft_model.lm_head.lora_B.weight, lm_head_lora_B_tensor)
             del lm_head_lora_B_tensor
 
-            lm_head_dora_magnitude = self.lm_head.dora_magnitude.full_tensor() if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.dora_magnitude)
+            lm_head_dora_magnitude = self.lm_head.dora_magnitude.weight if self.lm_head is not None else torch.zeros_like(self.draft_model.lm_head.dora_magnitude.weight)
             dist.broadcast(lm_head_dora_magnitude, src=self.lm_head_src_rank, group=self.pp_mesh.get_group())
-            _write_full_into_param(self.draft_model.lm_head.dora_magnitude, lm_head_dora_magnitude)
+            _write_full_into_param(self.draft_model.lm_head.dora_magnitude.weight, lm_head_dora_magnitude)
             del lm_head_dora_magnitude
 
     def maybe_sync(self, step):
