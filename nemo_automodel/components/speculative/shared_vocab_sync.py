@@ -8,7 +8,7 @@ from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 
 @dataclass
 class SharedVocabSyncConfig:
-    sync_interval: int = 100
+    sync_interval: int = 10
     update_embedding: bool = False
     update_lm_head: bool = False
     update_lm_head_adapters: bool = False
@@ -24,7 +24,6 @@ class SharedVocabSync:
     Synchronizes embedding and lm_head, and their associated lora adapters, 
     between target and draft models for concurrent training.
     """
-
     def __init__(self, cfg, model_parts, mesh_context, draft_model):
         self.cfg = cfg
         self.model_parts = model_parts
@@ -49,18 +48,27 @@ class SharedVocabSync:
         has an embedding layer.
         """
         has_embedding = False
+        update_embedding = False
         for mp in self.model_parts:
             embedding = mp.get_input_embeddings()
             if embedding is not None:
                 has_embedding = True
                 self.embedding = embedding
+                if embedding.requires_grad:
+                    update_embedding = True
                 break
         dist.barrier()
         has_embed = torch.tensor([int(has_embedding)], 
-                                 dtype=torch.int32, 
+                                 dtype=torch.long, 
                                  device=self.device_mesh.device)
         dist.all_reduce(has_embed, op=dist.ReduceOp.SUM, group=self.pp_group)
         assert has_embed[0] == 1, f"Expected only one rank to have an embedding layer per pipeline parallel process group, but found {has_embed[0]} such ranks."
+
+        update_embed = torch.tensor([int(update_embedding)], 
+                                 dtype=torch.long, 
+                                 device=self.device_mesh.device)
+        dist.all_reduce(update_embed, op=dist.ReduceOp.MAX, group=self.pp_group)
+        self.cfg.update_embedding = update_embed[0]
 
         global_rank = dist.get_rank()
         src_tensor = torch.tensor(
@@ -79,11 +87,19 @@ class SharedVocabSync:
         has an lm_head layer.
         """
         has_lm_head = False
+        update_lm_head_adapters = False
+        update_lm_head = False
         for mp in self.model_parts:
             lm_head = mp.get_output_embeddings()
             if lm_head is not None:
                 has_lm_head = True
                 self.lm_head = lm_head
+                if hasattr(lm_head, "lora_A"):
+                    update_lm_head_adapters = True
+                    update_lm_head = False
+                elif lm_head.requires_grad:
+                    update_lm_head_adapters = False
+                    update_lm_head = True
                 break
         dist.barrier()
         has_lm_head = torch.tensor([int(has_lm_head)], 
@@ -91,6 +107,19 @@ class SharedVocabSync:
                                  device=self.device_mesh.device)
         dist.all_reduce(has_lm_head, op=dist.ReduceOp.SUM, group=self.pp_group)
         assert has_lm_head[0] == 1, "Expected only one rank to have an lm_head layer per pipeline parallel process group, but found {has_lm_head[0]} such ranks."
+
+        update_lm_head_adapters = torch.tensor([int(update_lm_head_adapters)], 
+                                 dtype=torch.long, 
+                                 device=self.device_mesh.device)
+        dist.all_reduce(update_lm_head_adapters, op=dist.ReduceOp.MAX, group=self.pp_group)
+        self.cfg.update_lm_head_adapters = update_lm_head_adapters[0]
+
+        update_lm_head = torch.tensor([int(update_lm_head)], 
+                                 dtype=torch.long, 
+                                 device=self.device_mesh.device)
+        dist.all_reduce(update_lm_head, op=dist.ReduceOp.MAX, group=self.pp_group)
+        self.cfg.update_lm_head = update_lm_head[0]
+
         global_rank = dist.get_rank()
         src_tensor = torch.tensor(
             [global_rank if has_lm_head else -1], 
