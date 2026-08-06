@@ -942,6 +942,30 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             end_mlflow_active_run_as_killed()
 
     # ------------------ helpers ------------------
+
+    def _prepare_dspark_batch(self, batch):
+        """
+        Prepare a batch of data with the required attributes for training the draft model.
+        """
+        from nemo_automodel.components.llm.datasets.packed_sequence import CROSS_ENTROPY_IGNORE_IDX 
+        loss_mask = (batch["labels"] != CROSS_ENTROPY_IGNORE_IDX).long()
+
+        doc_remaining = []
+        for seq_len, seq_len_pad in zip(batch["seq_lens"], batch["seq_lens_padded"]):
+            num_pad = seq_len_pad - seq_len
+            current_doc = list(range(seq_len - 1, -1, -1)) + [0] * num_pad
+            doc_remaining += current_doc
+
+        dspark_batch = {
+            "input_ids": batch["input_ids"],
+            "loss_mask": loss_mask,
+            "position_ids": batch["position_ids"],
+            "seq_lens": batch["seq_lens_padded"],
+            "doc_remaining": torch.tensor(doc_remaining, device=self.device, dtype=torch.long),
+        }
+        return dspark_batch
+
+
     def _forward_backward_step(
         self,
         idx,
@@ -961,6 +985,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             )
             for k, v in batch.items()
         }
+        dspark_batch = self._prepare_dspark_batch(batch)
         cp_sharder = ContextParallelSharder(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
