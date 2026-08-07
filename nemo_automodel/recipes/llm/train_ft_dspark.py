@@ -740,6 +740,18 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
 
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
+        # DSpark draft model
+        dspark_cfg = self.cfg.get("dspark", None)
+        from nemo_automodel.recipes.llm.train_dspark_concurrent import TrainDSparkConcurrentRecipe
+        from nemo_automodel.components.speculative.shared_vocab_sync import SharedVocabSyncConfig
+        dspark_recipe = TrainDSparkConcurrentRecipe(cfg = dspark_cfg, dist_env = self.dist_env, device_mesh = self.device_mesh)
+        dspark_recipe.setup()
+        #TODO: Hard-coding this sync interval for now
+        shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = 1)
+        self.sync = shared_vocab_sync_cfg.build(model_parts = dspark_recipe.model_parts, mesh_context = self.mesh_context, draft_model = dspark_recipe.draft_model)
+
+
+
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
         self.neftune = None
