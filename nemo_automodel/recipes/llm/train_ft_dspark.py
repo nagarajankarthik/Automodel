@@ -744,11 +744,16 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         dspark_cfg = self.cfg.get("dspark", None)
         from nemo_automodel.recipes.llm.train_dspark_concurrent import TrainDSparkConcurrentRecipe
         from nemo_automodel.components.speculative.shared_vocab_sync import SharedVocabSyncConfig
+        from functools import partial
         dspark_recipe = TrainDSparkConcurrentRecipe(cfg = dspark_cfg, dist_env = self.dist_env, device_mesh = self.device_mesh)
         dspark_recipe.setup()
-        #TODO: Hard-coding this sync interval for now
-        shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = 1)
-        self.sync = shared_vocab_sync_cfg.build(model_parts = dspark_recipe.model_parts, mesh_context = self.mesh_context, draft_model = dspark_recipe.draft_model)
+        # Check peft config and retrieve lora_func
+        peft_cfg = self.cfg.get("peft", None)
+        lm_head_lora_func = None
+        if peft_cfg is not None and "lm_head" not in peft_cfg["exclude_modules"]:
+            lm_head_lora_func = partial(apply_lora_to_linear_modules, peft_cfg = peft_cfg, skip_freeze = False)
+        shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = dspark_cfg.recipe_args.vocab_sync_interval)
+        self.sync = shared_vocab_sync_cfg.build(model_parts = dspark_recipe.model_parts, mesh_context = self.mesh_context, draft_model = dspark_recipe.draft_model, lora_func=lm_head_lora_func)
 
 
 
