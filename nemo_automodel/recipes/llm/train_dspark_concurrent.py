@@ -924,6 +924,185 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         finally:
             self.wandb_run = None
 
+    def run_train_step(self, batches):
+        """Run the DSpark training loop for a single train step."""
+        self.trainer_module.train()
+        running_loss = 0.0
+        running_ce = 0.0
+        running_l1 = 0.0
+        running_conf = 0.0
+        # Acceptance diagnostics accumulate as (num, den) sums, not per-step
+        # ratios: reducing the sums and dividing once gives the exact global
+        # ratio regardless of per-micro-batch token imbalance, and keeps tau at
+        # its >= 1 floor even when a micro-batch contributes no valid blocks.
+        running_tau_num = 0.0
+        running_tau_den = 0.0
+        running_conf_abs_err_num = 0.0
+        running_conf_bias_num = 0.0
+        running_conf_cumprod_bias_num = 0.0
+        running_conf_diag_den = 0.0
+        running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
+        running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
+        running_micro = 0
+        epoch_loss = 0.0
+        micro_step = 0
+        pending_micro_batches = 0
+        completed_steps = 0
+        last_batch_idx = -1
+        for batch_idx, batch in enumerate(batches):
+            last_batch_idx = batch_idx
+            is_optim_step = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
+                batch_idx == num_batches - 1
+            )
+            # get_sync_ctx handles both DDP (no_sync) and FSDP2 (set_requires_gradient_sync).
+            with get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync):
+                metrics = self._forward_batch(batch)
+                loss = metrics.loss / self.grad_accumulation_steps
+                loss.backward()
+
+            running_loss += metrics.loss.detach().item()
+            running_ce += metrics.ce_loss.detach().item()
+            running_l1 += metrics.l1_loss.detach().item()
+            running_conf += metrics.confidence_loss.detach().item()
+            running_tau_num += metrics.tau_num.detach().item()
+            running_tau_den += metrics.tau_den.detach().item()
+            running_conf_abs_err_num += metrics.confidence_abs_error_num.detach().item()
+            running_conf_bias_num += metrics.confidence_bias_num.detach().item()
+            running_conf_cumprod_bias_num += metrics.confidence_cumprod_bias_num.detach().item()
+            running_conf_diag_den += metrics.confidence_diag_den.detach().item()
+            running_accept_pos_num += metrics.accept_rate_per_pos_num.detach()
+            running_accept_pos_den += metrics.accept_rate_per_pos_den.detach()
+            running_micro += 1
+            epoch_loss += metrics.loss.detach().item()
+            micro_step += 1
+            pending_micro_batches += 1
+
+            if pending_micro_batches == self.grad_accumulation_steps:
+                torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.lr_scheduler.step()
+                self._maybe_precompute_fp8_scales()
+                self.runtime.global_step += 1
+                completed_steps += 1
+                pending_micro_batches = 0
+                self._maybe_save_step_checkpoint(epoch_idx)
+
+                if self.runtime.global_step % self.log_every_steps == 0:
+                    # One collective: the loss window sums and micro-batch count,
+                    # the acceptance-diagnostic (num, den) sums, and the per-position
+                    # accept sums, concatenated so a single all-reduce covers them.
+                    # Losses divide by the micro-batch count (window mean of already
+                    # normalized values); the diagnostics divide num by den for the
+                    # exact global ratio.
+                    scalars = torch.tensor(
+                        [
+                            running_loss,
+                            running_ce,
+                            running_l1,
+                            running_conf,
+                            running_tau_num,
+                            running_tau_den,
+                            running_conf_abs_err_num,
+                            running_conf_bias_num,
+                            running_conf_cumprod_bias_num,
+                            running_conf_diag_den,
+                            float(running_micro),
+                        ],
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                    reduced = self._dp_allreduce(
+                        torch.cat([scalars, running_accept_pos_num, running_accept_pos_den])
+                    )
+                    n_scalars = scalars.numel()
+                    w = reduced[:n_scalars].tolist()
+                    pos_num = reduced[n_scalars : n_scalars + self.block_size]
+                    pos_den = reduced[n_scalars + self.block_size :]
+                    count = max(1.0, w[10])
+                    avg = {
+                        "loss": w[0] / count,
+                        "ce_loss": w[1] / count,
+                        "l1_loss": w[2] / count,
+                        "confidence_loss": w[3] / count,
+                    }
+                    # Log a diagnostic only when it was measured this window (its
+                    # denominator is positive), so an ablation without the TV signal
+                    # or the confidence head shows no curve rather than a flat zero
+                    # that reads like collapsed acceptance.
+                    accept_den = pos_den.sum().item()
+                    if accept_den > 0:
+                        avg["accept_rate"] = pos_num.sum().item() / accept_den
+                        _add_accept_rate_per_position(avg, pos_num, pos_den)
+                    if w[5] > 0:
+                        avg["tau"] = w[4] / w[5]
+                    if w[9] > 0:
+                        avg["confidence_abs_error"] = w[6] / w[9]
+                        avg["confidence_bias"] = w[7] / w[9]
+                        avg["confidence_cumprod_bias"] = w[8] / w[9]
+                    running_loss = running_ce = running_l1 = running_conf = 0.0
+                    running_tau_num = running_tau_den = 0.0
+                    running_conf_abs_err_num = running_conf_bias_num = 0.0
+                    running_conf_cumprod_bias_num = running_conf_diag_den = 0.0
+                    running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
+                    running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
+                    running_micro = 0
+                    if self.dist_env.is_main:
+                        current_lr = self.lr_scheduler.get_last_lr()[0]
+                        mem = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+                        self.metric_logger.log(
+                            MetricsSample(
+                                step=self.runtime.global_step,
+                                epoch=epoch_idx,
+                                metrics={**avg, "lr": current_lr, "mem": mem},
+                            )
+                        )
+                        # ``avg`` renames l1_loss -> tv_loss and carries only the
+                        # diagnostics measured this window, so mirror its keys under
+                        # the train/ prefix rather than hard-coding each one.
+                        wandb_metrics = {
+                            "train/tv_loss" if key == "l1_loss" else f"train/{key}": value
+                            for key, value in avg.items()
+                        }
+                        wandb_metrics.update(
+                            {"train/lr": current_lr, "train/mem_gib": mem, "train/epoch": epoch_idx}
+                        )
+                        self._wandb_log(wandb_metrics, step=self.runtime.global_step)
+                        if pbar is not None:
+                            pbar.set_postfix(loss=f"{avg['loss']:.4f}", lr=f"{current_lr:.2e}")
+                        accept = avg.get("accept_rate")
+                        tau = avg.get("tau")
+                        logger.info(
+                            "step %d | epoch %d | loss %.4f | ce %.4f | tv %.4f | conf %.4f | "
+                            "accept %s | tau %s | lr %.2e | mem %.2f GiB",
+                            self.runtime.global_step,
+                            epoch_idx,
+                            avg["loss"],
+                            avg["ce_loss"],
+                            avg["l1_loss"],
+                            avg["confidence_loss"],
+                            "n/a" if accept is None else f"{accept:.3f}",
+                            "n/a" if tau is None else f"{tau:.2f}",
+                            current_lr,
+                            mem,
+                        )
+
+        # Flush the trailing partial accumulation window (see EAGLE recipes
+        # for the rescale rationale).
+        if pending_micro_batches > 0:
+            scale = float(self.grad_accumulation_steps) / float(pending_micro_batches)
+            for p in self.trainer_module.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(scale)
+            torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.lr_scheduler.step()
+            self._maybe_precompute_fp8_scales()
+            self.runtime.global_step += 1
+            completed_steps += 1
+            pending_micro_batches = 0
+
     def run_train_validation_loop(self):
         """Run the DSpark training loop."""
         self.trainer_module.train()
