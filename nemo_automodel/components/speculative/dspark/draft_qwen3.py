@@ -228,9 +228,6 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        if config.lm_head_lora:
-            lora_func = config.lora_func
-            self.lm_head = lora_func(self.lm_head)
         self.block_size = int(config.block_size)
         self.mask_token_id = config.mask_token_id
         self.num_anchors = int(config.num_anchors)
@@ -283,6 +280,11 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
     def set_embedding_head_trainable(self, trainable: bool):
         self.embed_tokens.requires_grad_(trainable)
         self.lm_head.requires_grad_(trainable)
+
+    def apply_lora_lm_head(self, lora_func):
+        self.lm_head = lora_func(self.lm_head)
+
+
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
