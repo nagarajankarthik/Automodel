@@ -196,7 +196,7 @@ class SharedVocabSync:
             _write_full_into_param(self.draft_model.lm_head.lora_magnitude.weight, lm_head_lora_magnitude)
             del lm_head_lora_magnitude
 
-    def maybe_sync(self, step:int) -> None:
+    def update_draft_embed_lm_head(self, step:int) -> None:
         if step % self.cfg.sync_interval != 0:
             return
         self.capture(copy_embedding=self.cfg.update_embedding, copy_lm_head=self.cfg.update_lm_head)
