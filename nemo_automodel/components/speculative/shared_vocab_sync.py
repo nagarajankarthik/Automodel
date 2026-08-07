@@ -23,6 +23,11 @@ class SharedVocabSync:
     """
     Synchronizes embedding and lm_head, and their associated lora adapters, 
     between target and draft models for concurrent training.
+
+    The following scenarios are currently unsupported:
+    - qLoRA (this falls back to the transformers implementation)
+    - tied weights for embeddings and lm_head 
+    - tensor parallelism for weights and lm_head
     """
     def __init__(self, cfg, model_parts, mesh_context, draft_model):
         self.cfg = cfg
@@ -89,6 +94,7 @@ class SharedVocabSync:
         has_lm_head = False
         update_lm_head_adapters = False
         update_lm_head = False
+        update_lm_head_dora = False
         for mp in self.model_parts:
             lm_head = mp.get_output_embeddings()
             if lm_head is not None:
@@ -96,9 +102,11 @@ class SharedVocabSync:
                 self.lm_head = lm_head
                 if hasattr(lm_head, "lora_A"):
                     update_lm_head_adapters = True
+                    update_lm_head_dora = getattr(lm_head, "use_dora", False)
                     update_lm_head = False
                 elif lm_head.requires_grad:
                     update_lm_head_adapters = False
+                    update_lm_head_dora = False
                     update_lm_head = True
                 break
         dist.barrier()
@@ -108,17 +116,25 @@ class SharedVocabSync:
         dist.all_reduce(has_lm_head, op=dist.ReduceOp.SUM, group=self.pp_group)
         assert has_lm_head[0] == 1, "Expected only one rank to have an lm_head layer per pipeline parallel process group, but found {has_lm_head[0]} such ranks."
 
-        update_lm_head_adapters = torch.tensor([int(update_lm_head_adapters)], 
-                                 dtype=torch.long, 
-                                 device=self.device_mesh.device)
-        dist.all_reduce(update_lm_head_adapters, op=dist.ReduceOp.MAX, group=self.pp_group)
-        self.cfg.update_lm_head_adapters = update_lm_head_adapters[0]
 
         update_lm_head = torch.tensor([int(update_lm_head)], 
                                  dtype=torch.long, 
                                  device=self.device_mesh.device)
         dist.all_reduce(update_lm_head, op=dist.ReduceOp.MAX, group=self.pp_group)
         self.cfg.update_lm_head = update_lm_head[0]
+
+        update_lm_head_adapters = torch.tensor([int(update_lm_head_adapters)], 
+                                 dtype=torch.long, 
+                                 device=self.device_mesh.device)
+        dist.all_reduce(update_lm_head_adapters, op=dist.ReduceOp.MAX, group=self.pp_group)
+        self.cfg.update_lm_head_adapters = update_lm_head_adapters[0]
+
+        update_lm_head_dora = torch.tensor([int(update_lm_head_dora)], 
+                                 dtype=torch.long, 
+                                 device=self.device_mesh.device)
+        dist.all_reduce(update_lm_head_dora, op=dist.ReduceOp.MAX, group=self.pp_group)
+        self.cfg.update_lm_head_dora = update_lm_head_dora[0]
+
 
         global_rank = dist.get_rank()
         src_tensor = torch.tensor(
