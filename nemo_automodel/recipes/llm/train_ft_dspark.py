@@ -755,8 +755,6 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = dspark_cfg.recipe_args.vocab_sync_interval)
         self.sync = shared_vocab_sync_cfg.build(model_parts = dspark_recipe.model_parts, mesh_context = self.mesh_context, draft_model = dspark_recipe.draft_model, lora_func=lm_head_lora_func)
 
-
-
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
         self.neftune = None
@@ -1014,6 +1012,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         labels = batch.pop("labels")
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
+        # TODO: Add functionality to retrieve target's hidden states from selected layers.
         if self.pp_enabled:
             with train_ctx(), fp8_ctx:
                 losses = [] if self.pp.info.has_last_stage else None
@@ -1233,6 +1232,9 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         # Note(MegatronFSDP): Need to call these functions for MegatronFSDP if not using latest api
         # self.model_parts[0].install_optimized_model_weights()
         # self.model_parts[0].zero_grad_buffer()
+
+        # Update draft model's embedding and lm_head
+        self.sync.update_draft_embed_lm_head(self.step_scheduler.step)
 
         t = time.perf_counter()
         time_delta = t - self.timestamp
