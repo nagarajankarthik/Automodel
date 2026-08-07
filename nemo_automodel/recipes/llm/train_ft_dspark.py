@@ -745,8 +745,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         from nemo_automodel.recipes.llm.train_dspark_concurrent import TrainDSparkConcurrentRecipe
         from nemo_automodel.components.speculative.shared_vocab_sync import SharedVocabSyncConfig
         from functools import partial
-        dspark_recipe = TrainDSparkConcurrentRecipe(cfg = dspark_cfg, dist_env = self.dist_env, device_mesh = self.device_mesh)
-        dspark_recipe.setup()
+        self.dspark_recipe = TrainDSparkConcurrentRecipe(cfg = dspark_cfg, dist_env = self.dist_env, device_mesh = self.device_mesh)
+        self.dspark_recipe.setup()
         # Check peft config and retrieve lora_func
         peft_cfg = self.cfg.get("peft", None)
         lm_head_lora_func = None
@@ -1000,7 +1000,6 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             )
             for k, v in batch.items()
         }
-        dspark_batch = self._prepare_dspark_batch(batch)
         cp_sharder = ContextParallelSharder(
             self.model_parts[0] if hasattr(self, "model_parts") else None,
             self.device_mesh,
@@ -1182,6 +1181,10 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
+            dspark_batch = self._prepare_dspark_batch(batch)
+            dspark_batch = {k : v.to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()}
+            # Add target's hidden states to dspark_batch before sending to draft model
+            self.dspark_recipe._forward_batch(dspark_batch)
 
             if i == 0:
                 prepare_after_first_microbatch()
