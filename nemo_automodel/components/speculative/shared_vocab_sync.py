@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, distribute_tensor
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+from collections.abc import Callable
 
 
 
@@ -14,9 +15,9 @@ class SharedVocabSyncConfig:
     update_lm_head_adapters: bool = False
     update_lm_head_dora: bool = False
 
-    def build(self, *, model_parts, mesh_context, draft_model) -> "SharedVocabSync":
+    def build(self, *, model_parts, mesh_context, draft_model, lora_func) -> "SharedVocabSync":
         sync = SharedVocabSync(self, model_parts, mesh_context, draft_model)
-        sync.capture(copy_embedding=True, copy_lm_head=True)
+        sync.capture(copy_embedding=True, copy_lm_head=True, lora_func=lora_func)
         return sync
 
 class SharedVocabSync:
@@ -148,10 +149,16 @@ class SharedVocabSync:
             raise RuntimeError("No sender rank identified for lm_head layer.")
 
 
-    def capture(self, copy_embedding:bool=False, copy_lm_head:bool=False):
+    def capture(self, copy_embedding:bool=False, copy_lm_head:bool=False, lora_func:Callable=None):
         """
         Copy embeddings, lm_head and lora adapters from the target to the draft model.
+        Apply lora_func to the lm_head if provided. This is a one-time operation performed 
+        during setup only.
         """
+
+        if lora_func is not None:
+            self.draft_model.apply_lora_lm_head(lora_func)
+
         # Embeddings
         if copy_embedding:
             embed_tensor = self.embedding.weight.full_tensor() if self.embedding is not None else torch.zeros_like(self.draft_model.embed_tokens.weight)
