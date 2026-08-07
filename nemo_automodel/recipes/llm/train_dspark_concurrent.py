@@ -493,8 +493,6 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
             draft_config["confidence_head_with_markov"] = bool(recipe_cfg.get("confidence_head_with_markov", True))
         # The draft owns an independent (frozen) lm_head seeded from the target.
         draft_config["tie_word_embeddings"] = False
-        draft_config["lm_head_lora"] = recipe_cfg.get("lm_head_lora", True)
-        draft_config["lora_func"] = recipe_cfg.get("lora_func", None)
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
 
