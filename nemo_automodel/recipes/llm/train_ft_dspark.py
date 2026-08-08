@@ -997,18 +997,24 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         from nemo_automodel.components.llm.datasets.packed_sequence import CROSS_ENTROPY_IGNORE_IDX 
         loss_mask = (batch["labels"] != CROSS_ENTROPY_IGNORE_IDX).long()
 
-        doc_remaining = []
-        for seq_len, seq_len_pad in zip(batch["seq_lens"], batch["seq_lens_padded"]):
-            num_pad = seq_len_pad - seq_len
-            current_doc = list(range(seq_len - 1, -1, -1)) + [0] * num_pad
-            doc_remaining += current_doc
+        # See nemo_automodel/components/datasets/utils.py
+        SENTINEL = -1000
+        rows = []
+        for lens, lens_pad in zip(batch["seq_lens"].tolist(), batch["seq_lens_padded"].tolist()):
+            row = []
+            for seq_len, seq_len_pad in zip(lens, lens_pad):
+                if seq_len == SENTINEL:          # padding column from a longer-packed sample
+                    continue
+                row += list(range(seq_len - 1, -1, -1)) + [0] * (seq_len_pad - seq_len)
+            rows.append(row)
+        doc_remaining = torch.tensor(rows, device=self.dist_env.device, dtype=torch.long)   # [B, S]
 
         dspark_batch = {
             "input_ids": batch["input_ids"],
             "loss_mask": loss_mask,
             "position_ids": batch["position_ids"],
             "seq_lens": batch["seq_lens_padded"],
-            "doc_remaining": torch.tensor(doc_remaining, device=self.device, dtype=torch.long),
+            "doc_remaining": doc_remaining,
         }
         return dspark_batch
 
@@ -1221,20 +1227,19 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             dspark_cfg = self.cfg.get("dspark", None)
             target_layer_ids = dspark_cfg.recipe_args.target_layer_ids
             num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
-            assert dspark_batch["input_ids"].shape[1] % num_chunks == 0, f"input_ids shape {dspark_batch['input_ids'].shape} is not divisible by num_chunks {num_chunks}"
-            chunk_len = dspark_batch["input_ids"].shape[1] // num_chunks
+            chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
             for idx in range(num_chunks):
                 hidden_states_list = []
                 for layer_id in target_layer_ids[:-1]:
-                    assert self.captured.get(layer_id, None) is not None, f"layer_id {layer_id} is not captured"
+                    assert self.captured[layer_id][idx].shape[0] == chunk_len
                     cp_sharded_hidden_states = self.captured.get(layer_id, None)[idx]
-                    gathered_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_hidden_states)
+                    gathered_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
                     hidden_states_list.append(gathered_hidden_states)
                 cp_sharded_last_hidden_states = self.captured.get(target_layer_ids[-1], None)[idx]
-                gathered_last_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_last_hidden_states)
-                start = idx * chunk_len
+                gathered_last_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_last_hidden_states, trim = True, fill = 0.0)
+                start_idx = idx * chunk_len
                 dspark_batch_current = {
-                    k : v[start_idx:start_idx+chunk_len].to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()
+                        k : v[start_idx:start_idx+chunk_len].to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()
                 }
                 dspark_batch_current["target_hidden_states"] = torch.cat(hidden_states_list, dim=-1)
                 dspark_batch_current["target_last_hidden_states"] = gathered_last_hidden_states

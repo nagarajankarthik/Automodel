@@ -20,9 +20,7 @@ dependency, and a confidence head predicts per-position acceptance. This recipe
 mirrors the EAGLE / DFlash scaffolding -- online target hidden-state capture,
 gradient accumulation with a trailing-window flush, and the shared checkpointer
 plumbing -- and trains the draft with the three-term DSpark objective.
-"""
 
-"""
 Adapt train_dspark.py for training a DSpark drafter concurrently with a main model.
 """
 
