@@ -11,12 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""
-Modify TrainFinetuneRecipeForNextTokenPrediction recipe in train_ft.py to allow 
-training a DSpark drafter simultanously with the main model on the same set of 
-GPUs.
-"""
+# Modify TrainFinetuneRecipeForNextTokenPrediction recipe in train_ft.py to allow 
+# training a DSpark drafter simultanously with the main model on the same set of 
+# GPUs.
 
 
 from __future__ import annotations
@@ -399,7 +396,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     return wrapper
 
 
-def _make_hook(layer_id: int):
+def _make_hook(layer_id: int, captured: Dict[int, List[torch.Tensor]]):
     def _hook(_module, _inputs, outputs):
         captured.setdefault(layer_id, []).append(outputs[0].detach() if isinstance(outputs, tuple) else outputs.detach())
 
@@ -780,7 +777,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         # Check peft config and retrieve lora_func
         peft_cfg = self.cfg.get("peft", None)
         lm_head_lora_func = None
-        if peft_cfg is not None and "lm_head" not in peft_cfg["exclude_modules"]:
+        if peft_cfg is not None and "lm_head" not in peft_cfg.get("exclude_modules", []):
             lm_head_lora_func = partial(patch_linear_module, 
                                         dim = peft_cfg.dim, 
                                         alpha = peft_cfg.alpha, 
@@ -1224,19 +1221,26 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             dspark_cfg = self.cfg.get("dspark", None)
             target_layer_ids = dspark_cfg.recipe_args.target_layer_ids
             num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
+            assert dspark_batch["input_ids"].shape[1] % num_chunks == 0, f"input_ids shape {dspark_batch['input_ids'].shape} is not divisible by num_chunks {num_chunks}"
+            chunk_len = dspark_batch["input_ids"].shape[1] // num_chunks
             for idx in range(num_chunks):
                 hidden_states_list = []
                 for layer_id in target_layer_ids[:-1]:
-                    cp_sharded_hidden_states = captured.get(layer_id, None)[idx]
+                    assert self.captured.get(layer_id, None) is not None, f"layer_id {layer_id} is not captured"
+                    cp_sharded_hidden_states = self.captured.get(layer_id, None)[idx]
                     gathered_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_hidden_states)
                     hidden_states_list.append(gathered_hidden_states)
-                cp_sharded_last_hidden_states = captured.get(target_layer_ids[-1], None)[idx]
+                cp_sharded_last_hidden_states = self.captured.get(target_layer_ids[-1], None)[idx]
                 gathered_last_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_last_hidden_states)
-                dspark_batch["target_hidden_states"] = torch.cat(hidden_states_list, dim=-1)
-                dspark_batch["target_last_hidden_states"] = gathered_last_hidden_states
-                self.dspark_recipe.run_train_step([dspark_batch])
+                start = idx * chunk_len
+                dspark_batch_current = {
+                    k : v[start_idx:start_idx+chunk_len].to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()
+                }
+                dspark_batch_current["target_hidden_states"] = torch.cat(hidden_states_list, dim=-1)
+                dspark_batch_current["target_last_hidden_states"] = gathered_last_hidden_states
+                self.dspark_recipe.run_train_step([dspark_batch_current])
 
-            captured.clear()
+            self.captured.clear()
 
             if i == 0:
                 prepare_after_first_microbatch()

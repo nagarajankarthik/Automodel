@@ -55,13 +55,12 @@ class SharedVocabSync:
                 if embedding.weight.requires_grad:
                     update_embedding = True
                 break
-        dist.barrier()
         embed_count = torch.tensor([int(has_embedding)], 
                                  dtype=torch.long, 
                                  device="cuda")
         if self.pp_degree > 1:
             dist.all_reduce(embed_count, op=dist.ReduceOp.SUM, group=self.pp_group)
-        assert embed_count.item() == 1, f"Expected only one rank to have an embedding layer per pipeline parallel process group, but found {has_embed[0]} such ranks."
+        assert embed_count.item() == 1, f"Expected only one rank to have an embedding layer per pipeline parallel process group, but found {embed_count.item()} such ranks."
 
         update_embed = torch.tensor([int(update_embedding)], 
                                  dtype=torch.long, 
@@ -105,14 +104,12 @@ class SharedVocabSync:
                     update_lm_head_dora = False
                     update_lm_head = True
                 break
-        dist.barrier()
         head_count = torch.tensor([int(has_lm_head)], 
                                  dtype=torch.long, 
                                  device="cuda")
         if self.pp_degree > 1:
             dist.all_reduce(head_count, op=dist.ReduceOp.SUM, group=self.pp_group)
-        assert head_count.item() == 1, f"Expected only one rank to have an lm_head layer per pipeline parallel process group, but found {has_lm_head[0]} such ranks."
-
+        assert head_count.item() == 1, f"Expected only one rank to have an lm_head layer per pipeline parallel process group, but found {head_count.item()} such ranks."
 
         update_lm_head = torch.tensor([int(update_lm_head)], 
                                  dtype=torch.long, 
@@ -161,7 +158,7 @@ class SharedVocabSync:
         # Embeddings
         draft_embed = self.draft_model.embed_tokens.weight
         if copy_embedding:
-            embed_tensor = _gather_full(self.embedding).to(draft_embed.dtype) if self.embedding is not None else torch.empty(draft_embed.shape, dtype=draft_embed.dtype, device=draft_embed.device)
+            embed_tensor = _gather_full(self.embedding.weight).to(draft_embed.dtype) if self.embedding is not None else torch.empty(draft_embed.shape, dtype=draft_embed.dtype, device=draft_embed.device)
             if self.pp_degree > 1:
                 dist.broadcast(embed_tensor, src=self.embedding_src_rank, group=self.pp_group)
             _write_full_into_param(draft_embed, embed_tensor)
@@ -170,7 +167,7 @@ class SharedVocabSync:
         # lm head
         draft_lm_head = self.draft_model.lm_head.weight
         if copy_lm_head:
-            lm_head_tensor = _gather_full(self.lm_head).to(draft_lm_head.dtype) if self.lm_head is not None else torch.empty(draft_lm_head.shape, dtype=draft_lm_head.dtype, device=draft_lm_head.device)
+            lm_head_tensor = _gather_full(self.lm_head.weight).to(draft_lm_head.dtype) if self.lm_head is not None else torch.empty(draft_lm_head.shape, dtype=draft_lm_head.dtype, device=draft_lm_head.device)
             if self.pp_degree > 1:
                 dist.broadcast(lm_head_tensor, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(draft_lm_head, lm_head_tensor)
@@ -179,14 +176,14 @@ class SharedVocabSync:
         # Lora adapters
         if self.update_lm_head_adapters:
             draft_lm_head_lora_A = self.draft_model.lm_head.lora_A.weight
-            lm_head_lora_A_tensor = _gather_full(self.lm_head.lora_A).to(draft_lm_head_lora_A.dtype) if self.lm_head is not None else torch.empty(draft_lm_head_lora_A.shape, dtype=draft_lm_head_lora_A.dtype, device=draft_lm_head_lora_A.device)
+            lm_head_lora_A_tensor = _gather_full(self.lm_head.lora_A.weight).to(draft_lm_head_lora_A.dtype) if self.lm_head is not None else torch.empty(draft_lm_head_lora_A.shape, dtype=draft_lm_head_lora_A.dtype, device=draft_lm_head_lora_A.device)
             if self.pp_degree > 1:
                 dist.broadcast(lm_head_lora_A_tensor, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(draft_lm_head_lora_A, lm_head_lora_A_tensor)
             del lm_head_lora_A_tensor
             
             draft_lm_head_lora_B = self.draft_model.lm_head.lora_B.weight
-            lm_head_lora_B_tensor = _gather_full(self.lm_head.lora_B).to(draft_lm_head_lora_B.dtype) if self.lm_head is not None else torch.empty(draft_lm_head_lora_B.shape, dtype=draft_lm_head_lora_B.dtype, device=draft_lm_head_lora_B.device)
+            lm_head_lora_B_tensor = _gather_full(self.lm_head.lora_B.weight).to(draft_lm_head_lora_B.dtype) if self.lm_head is not None else torch.empty(draft_lm_head_lora_B.shape, dtype=draft_lm_head_lora_B.dtype, device=draft_lm_head_lora_B.device)
             if self.pp_degree > 1:
                 dist.broadcast(lm_head_lora_B_tensor, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(self.draft_model.lm_head.lora_B.weight, lm_head_lora_B_tensor)
@@ -194,7 +191,7 @@ class SharedVocabSync:
 
         if self.update_lm_head_dora:
             draft_lm_head_lora_magnitude = self.draft_model.lm_head.lora_magnitude
-            lm_head_lora_magnitude = _gather_full(self.lm_head.lora_magnitude) if self.lm_head is not None else torch.empty(draft_lm_head_lora_magnitude.shape, dtype=draft_lm_head_lora_magnitude.dtype, device=draft_lm_head_lora_magnitude.device)
+            lm_head_lora_magnitude = _gather_full(self.lm_head.lora_magnitude).to(draft_lm_head_lora_magnitude.dtype) if self.lm_head is not None else torch.empty(draft_lm_head_lora_magnitude.shape, dtype=draft_lm_head_lora_magnitude.dtype, device=draft_lm_head_lora_magnitude.device)
             if self.pp_degree > 1:
                 dist.broadcast(lm_head_lora_magnitude, src=self.lm_head_src_rank, group=self.pp_group)
             _write_full_into_param(draft_lm_head_lora_magnitude, lm_head_lora_magnitude)

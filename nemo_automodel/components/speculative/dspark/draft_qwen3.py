@@ -284,8 +284,6 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
     def apply_lora_lm_head(self, lora_func):
         self.lm_head = lora_func(self.lm_head)
 
-
-
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
