@@ -399,6 +399,29 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
     return wrapper
 
 
+def _make_hook(layer_id: int):
+    def _hook(_module, _inputs, outputs):
+        captured.setdefault(layer_id, []).append(outputs[0] if isinstance(outputs, tuple) else outputs)
+
+    return _hook
+
+def attach_capture_hooks(model_parts, target_layer_ids, captured):
+    handles = []
+    for part in model_parts:                     # interleaved PP → several parts per rank
+        backbone = getattr(part, "model", part)
+        container = getattr(backbone, "layers", None)
+        if container is None:
+            continue
+        for lid in target_layer_ids:
+            if isinstance(container, nn.ModuleDict):
+                mod = container[str(lid)] if str(lid) in container else None   # global id key
+            else:
+                mod = container[lid] if lid < len(container) else None         # ModuleList, off-PP
+            if mod is not None:
+                handles.append(mod.register_forward_hook(_make_hook(lid, captured)))
+    return handles
+
+
 # ---------------------------------------------------------------------------
 #  Trainer class – orchestration only
 # ---------------------------------------------------------------------------
@@ -741,10 +764,16 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
 
         # DSpark draft model
-        dspark_cfg = self.cfg.get("dspark", None)
+
         from nemo_automodel.recipes.llm.train_dspark_concurrent import TrainDSparkConcurrentRecipe
         from nemo_automodel.components.speculative.shared_vocab_sync import SharedVocabSyncConfig
         from functools import partial
+        dspark_cfg = self.cfg.get("dspark", None)
+
+        # Attach hooks to retrieve hidden states 
+        self.captured = {}
+        attach_capture_hooks(self.model_parts, dspark_cfg.recipe_args.target_layer_ids, self.captured)
+        # Set up DSpark recipe and model
         self.dspark_recipe = TrainDSparkConcurrentRecipe(cfg = dspark_cfg, dist_env = self.dist_env, device_mesh = self.device_mesh)
         self.dspark_recipe.setup()
         # Check peft config and retrieve lora_func
@@ -1184,7 +1213,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             dspark_batch = self._prepare_dspark_batch(batch)
             dspark_batch = {k : v.to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()}
             # Add target's hidden states to dspark_batch before sending to draft model
-            self.dspark_recipe._forward_batch(dspark_batch)
+            self.dspark_recipe.run_train_step([dspark_batch])
 
             if i == 0:
                 prepare_after_first_microbatch()
