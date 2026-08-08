@@ -767,7 +767,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         from nemo_automodel.components._peft.lora import patch_linear_module
         from functools import partial
         dspark_cfg = self.cfg.get("dspark", None)
-
+        assert len(dspark_cfg.recipe_args.target_layer_ids) >= 2, "At least 2 target layers are required for DSpark recipe."
         # Attach hooks to retrieve hidden states 
         self.captured = {}
         attach_capture_hooks(self.model_parts, dspark_cfg.recipe_args.target_layer_ids, self.captured)
@@ -1232,6 +1232,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 hidden_states_list = []
                 for layer_id in target_layer_ids[:-1]:
                     assert self.captured[layer_id][idx].shape[0] == chunk_len
+                    assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
                     cp_sharded_hidden_states = self.captured.get(layer_id, None)[idx]
                     gathered_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
                     hidden_states_list.append(gathered_hidden_states)
