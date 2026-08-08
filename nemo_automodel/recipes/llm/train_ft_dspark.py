@@ -401,7 +401,7 @@ def _build_pp_collate_wrapper(cfg_model, pp_enabled: bool):
 
 def _make_hook(layer_id: int):
     def _hook(_module, _inputs, outputs):
-        captured.setdefault(layer_id, []).append(outputs[0] if isinstance(outputs, tuple) else outputs)
+        captured.setdefault(layer_id, []).append(outputs[0].detach() if isinstance(outputs, tuple) else outputs.detach())
 
     return _hook
 
@@ -1150,6 +1150,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
+        return cp_sharder
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1207,13 +1208,29 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            self._forward_backward_step(
+            cp_sharder = self._forward_backward_step(
                 i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
             )
             dspark_batch = self._prepare_dspark_batch(batch)
+
             dspark_batch = {k : v.to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()}
             # Add target's hidden states to dspark_batch before sending to draft model
-            self.dspark_recipe.run_train_step([dspark_batch])
+            dspark_cfg = self.cfg.get("dspark", None)
+            target_layer_ids = dspark_cfg.recipe_args.target_layer_ids
+            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
+            for idx in range(num_chunks):
+                hidden_states_list = []
+                for layer_id in target_layer_ids[:-1]:
+                    cp_sharded_hidden_states = captured.get(layer_id, None)[idx]
+                    gathered_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_hidden_states)
+                    hidden_states_list.append(gathered_hidden_states)
+                cp_sharded_last_hidden_states = captured.get(target_layer_ids[-1], None)[idx]
+                gathered_last_hidden_states = cp_sharder.gather_token_tensor(cp_sharded_last_hidden_states)
+                dspark_batch["target_hidden_states"] = torch.cat(hidden_states_list, dim=-1)
+                dspark_batch["target_last_hidden_states"] = gathered_last_hidden_states
+                self.dspark_recipe.run_train_step([dspark_batch])
+
+            captured.clear()
 
             if i == 0:
                 prepare_after_first_microbatch()
