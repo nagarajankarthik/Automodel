@@ -767,6 +767,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
 
         from nemo_automodel.recipes.llm.train_dspark_concurrent import TrainDSparkConcurrentRecipe
         from nemo_automodel.components.speculative.shared_vocab_sync import SharedVocabSyncConfig
+        from nemo_automodel.components._peft.lora import patch_linear_module
         from functools import partial
         dspark_cfg = self.cfg.get("dspark", None)
 
@@ -780,9 +781,14 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         peft_cfg = self.cfg.get("peft", None)
         lm_head_lora_func = None
         if peft_cfg is not None and "lm_head" not in peft_cfg["exclude_modules"]:
-            lm_head_lora_func = partial(apply_lora_to_linear_modules, peft_cfg = peft_cfg, skip_freeze = False)
+            lm_head_lora_func = partial(patch_linear_module, 
+                                        dim = peft_cfg.dim, 
+                                        alpha = peft_cfg.alpha, 
+                                        dropout = peft_cfg.get("dropout", 0.0), 
+                                        use_dora = peft_cfg.get("use_dora", False),
+                                        use_triton = peft_cfg.get("use_triton", False))
         shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = dspark_cfg.recipe_args.vocab_sync_interval)
-        self.sync = shared_vocab_sync_cfg.build(model_parts = dspark_recipe.model_parts, mesh_context = self.mesh_context, draft_model = dspark_recipe.draft_model, lora_func=lm_head_lora_func)
+        self.sync = shared_vocab_sync_cfg.build(model_parts = self.model_parts, mesh_context = self.mesh_context, draft_model = self.dspark_recipe.draft_model, lora_func=lm_head_lora_func)
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
