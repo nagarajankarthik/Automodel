@@ -403,7 +403,7 @@ def _make_hook(layer_id: int, captured: Dict[int, List[torch.Tensor]]):
     return _hook
 
 def attach_capture_hooks(model_parts, target_layer_ids, captured):
-    handles = []
+    handles, owned = [], set()
     for part in model_parts:                     # interleaved PP → several parts per rank
         backbone = getattr(part, "model", part)
         container = getattr(backbone, "layers", None)
@@ -416,7 +416,8 @@ def attach_capture_hooks(model_parts, target_layer_ids, captured):
                 mod = container[lid] if lid < len(container) else None         # ModuleList, off-PP
             if mod is not None:
                 handles.append(mod.register_forward_hook(_make_hook(lid, captured)))
-    return handles
+                owned.add(lid)
+    return handles, owned
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +771,26 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         assert len(dspark_cfg.recipe_args.target_layer_ids) >= 2, "At least 2 target layers are required for DSpark recipe."
         # Attach hooks to retrieve hidden states 
         self.captured = {}
-        attach_capture_hooks(self.model_parts, dspark_cfg.recipe_args.target_layer_ids, self.captured)
+        _hook_handles, self.owned_layers = attach_capture_hooks(self.model_parts, dspark_cfg.recipe_args.target_layer_ids, self.captured)
+        target_layer_ids = list(dspark_cfg.recipe_args.target_layer_ids)
+        layer_owners = torch.full((len(target_layer_ids),), -1, dtype=torch.long, device=self.dist_env.device)
+        layer_counts = torch.zeros((len(target_layer_ids),), dtype=torch.long, device=self.dist_env.device)
+        for layer_idx, layer_id in enumerate(target_layer_ids):
+            if layer_id in self.owned_layers:
+                layer_owners[layer_idx] = dist.get_rank()
+                layer_counts[layer_idx] = 1
+
+        if self.mesh_context.pp_size > 1:
+            pp_mesh = get_flat_mesh(self.device_mesh, "pp")
+            pp_group = pp_mesh.get_group()
+            dist.all_reduce(layer_owners, op=dist.ReduceOp.MAX, group=pp_group)
+            dist.all_reduce(layer_counts, op=dist.ReduceOp.SUM, group=pp_group)
+
+        self.layer_src_rank = {}
+        for layer_count, layer_id, layer_owner in zip(layer_counts, target_layer_ids, layer_owners):
+            assert layer_count.item() == 1, f"Expected only one rank to own layer {layer_id} per pipeline parallel process group, but found {layer_count} such ranks."
+            self.layer_src_rank[layer_id] = layer_owner.item()
+
         # Set up DSpark recipe and model
         lm_head_adapted = (
             self.peft_config is not None and "lm_head" not in self.peft_config.exclude_modules
@@ -1232,19 +1252,32 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 target_layer_ids = dspark_cfg.recipe_args.target_layer_ids
                 num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
                 chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
+                packed_seq_len = dspark_batch["input_ids"].shape[1]
+                cp_degree = self.mesh_context.cp_size
 
                 # Gather hidden states at target layers.
                 # This requires num_target_layers * local_batch_size *  sequence_length * hidden_size * 2 bytes of vRAM on every GPU. Watch out for OOM errors.
                 # It is assumed that the elements of target_layer_ids are sorted in ascending order
                 # self.captured[layer_id] is a list of length num_chunks, where each element is a tensor of shape [chunk_len, sequence_length/cp_degree, hidden_size]
                 for layer_id in target_layer_ids:
-                    assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
-                    assert self.captured[layer_id][0].shape[0] == chunk_len, f"Captured hidden states for the first micro-batch should have shape [chunk_len, sequence_length/cp_degree, hidden_size], but got {self.captured[layer_id][0].shape}"
-                    if self.step_scheduler.step == 1:
-                        print(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
-                        print(f"NK_DEBUG: chunk_len: {chunk_len}")
-                    cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
-                    cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
+                    if layer_id in self.owned_layers:
+                        assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
+                        assert self.captured[layer_id][0].shape[0] == chunk_len, f"Captured hidden states for the first micro-batch should have shape [chunk_len, sequence_length/cp_degree, hidden_size], but got {self.captured[layer_id][0].shape}"
+                        if self.step_scheduler.step == 1:
+                            print(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
+                            print(f"NK_DEBUG: chunk_len: {chunk_len}")
+                        cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
+                        cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
+                    else:
+                        cp_sharded_hidden_states = torch.zeros((num_chunks * chunk_len, packed_seq_len // cp_degree, self.model_parts[0].config.hidden_size), 
+                                                               device=self.dist_env.device,
+                                                               dtype=self.model_parts[0].config.torch_dtype)
+                    
+                    if self.pp_enabled:
+                        pp_mesh = get_flat_mesh(self.device_mesh, "pp")
+                        pp_group = pp_mesh.get_group()
+                        dist.broadcast(cp_sharded_hidden_states, src=self.layer_src_rank[layer_id], group=pp_group)
+
                     gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
 
 
