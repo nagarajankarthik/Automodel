@@ -397,7 +397,7 @@ def _add_accept_rate_per_position(
 class TrainDSparkConcurrentRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
-    def __init__(self, cfg, dist_env=None, device_mesh=None):
+    def __init__(self, cfg, dist_env=None, device_mesh=None, target_peft_config=None):
         """
         This recipe is expected to be called from the 
         TrainFinetuneRecipeForNextTokenPredictionDSpark recipe's setup method.
@@ -407,6 +407,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         self.cfg = cfg
         self.dist_env = dist_env
         self.device_mesh = device_mesh
+        self.target_peft_config = target_peft_config
 
 
     def setup(self):
@@ -496,6 +497,14 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
 
         draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
+        if self.target_peft_config is not None:
+            patch_linear_module(self.draft_model.lm_head, 
+                                dim = self.target_peft_config.dim, 
+                                alpha = self.target_peft_config.alpha, 
+                                use_triton = self.target_peft_config.use_triton,
+                                dropout = self.target_peft_config.dropout,
+                                dropout_position = self.target_peft_config.dropout_position,
+                                use_dora = self.target_peft_config.use_dora)
         if self.packed_sequence_size > 0 and type(self.draft_model).__name__ != "Qwen3DSparkModel":
             # Only the Qwen3 draft forward threads the packing metadata so far; the
             # other DSpark drafts would silently let anchors cross document boundaries.

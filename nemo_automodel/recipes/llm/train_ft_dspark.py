@@ -772,20 +772,18 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         self.captured = {}
         attach_capture_hooks(self.model_parts, dspark_cfg.recipe_args.target_layer_ids, self.captured)
         # Set up DSpark recipe and model
-        self.dspark_recipe = TrainDSparkConcurrentRecipe(cfg = dspark_cfg, dist_env = self.dist_env, device_mesh = self.device_mesh)
+        lm_head_adapted = (
+            self.peft_config is not None and "lm_head" not in self.peft_config.exclude_modules
+        )
+        self.dspark_recipe = TrainDSparkConcurrentRecipe(
+            cfg=dspark_cfg,
+            dist_env=self.dist_env,
+            device_mesh=self.device_mesh,
+            target_peft_config=self.peft_config if lm_head_adapted else None,
+        )
         self.dspark_recipe.setup()
-        # Check peft config and retrieve lora_func
-        peft_cfg = self.cfg.get("peft", None)
-        lm_head_lora_func = None
-        if peft_cfg is not None and "lm_head" not in peft_cfg.get("exclude_modules", []):
-            lm_head_lora_func = partial(patch_linear_module, 
-                                        dim = peft_cfg.dim, 
-                                        alpha = peft_cfg.alpha, 
-                                        dropout = peft_cfg.get("dropout", 0.0), 
-                                        use_dora = peft_cfg.get("use_dora", False),
-                                        use_triton = peft_cfg.get("use_triton", False))
-        shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = dspark_cfg.recipe_args.vocab_sync_interval)
-        self.sync = shared_vocab_sync_cfg.build(model_parts = self.model_parts, mesh_context = self.mesh_context, draft_model = self.dspark_recipe.draft_model, lora_func=lm_head_lora_func)
+        shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = int(dspark_cfg.recipe_args.vocab_sync_interval))
+        self.sync = shared_vocab_sync_cfg.build(model_parts = self.model_parts, mesh_context = self.mesh_context, draft_model = self.dspark_recipe.draft_model)
 
         # NEFTune: noisy embeddings for improved instruction fine-tuning
         neftune_cfg = self.cfg.get("neftune", None)
