@@ -1259,7 +1259,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                     last_id = target_layer_ids[-1]
                     dspark_batch_current["target_last_hidden_states"] = gathered_hidden_states[last_id][start_idx:start_idx+chunk_len]
 
-                    self.dspark_recipe.run_train_step([dspark_batch_current])
+                    self.dspark_recipe.run_train_step(dspark_batch_current)
 
             finally:
                 gathered_hidden_states.clear()
