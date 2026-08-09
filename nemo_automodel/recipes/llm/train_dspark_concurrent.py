@@ -211,9 +211,6 @@ def get_warmup_stable_lambda(warmup_steps, min_lr_ratio=0.0):
     return lr_lambda
     
     
-
-
-
 class _DraftArgs(dict):
     """Dict with attribute access for the per-architecture draft-config builders."""
 
@@ -439,7 +436,7 @@ def _add_accept_rate_per_position(
 class TrainDSparkConcurrentRecipe(BaseRecipe):
     """Recipe for DSpark draft-model training on Qwen3, Gemma4, DeepSeek V4, GLM-5.2, and MiniMax M3 VL targets."""
 
-    def __init__(self, cfg, dist_env=None, device_mesh=None, target_peft_config=None):
+    def __init__(self, cfg, dist_env=None, device_mesh=None, target_peft_config=None, target_config=None):
         """
         This recipe is expected to be called from the 
         TrainFinetuneRecipeForNextTokenPredictionDSpark recipe's setup method.
@@ -450,6 +447,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         self.dist_env = dist_env
         self.device_mesh = device_mesh
         self.target_peft_config = target_peft_config
+        self.target_config = target_config
 
 
     def setup(self):
@@ -492,17 +490,12 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
 
         self.block_size = int(recipe_cfg.get("block_size", 7))
         self.num_anchors = int(recipe_cfg.get("num_anchors", 512))
+        target_text_config = self.target_config.text_config if hasattr(self.target_config, "text_config") else self.target_config
         self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
         embed_src = None
         head_src = None
         assert self.cached_target_path is None, "DSpark concurrent training does not support cached targets."
-        if self.packed_sequence_size > 0:
-            _validate_packing_gates(
-                cp_size=int(self.cfg.get("distributed.cp_size", 1) or 1),
-                target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
-                micro_batch_size=int(recipe_cfg.micro_batch_size),
-            )
         
         # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
         # The DeepSeek V4 and GLM-5.2 drafts instead consume a dense additive mask
@@ -516,7 +509,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # Qwen3-style draft: a small non-causal stack reusing the target's
         # architecture defaults plus the DSpark-specific fields.
         # Qwen3 is the only draft architecture currently supported by this recipe.
-        draft_config = {}
+        draft_config = self.target_config.to_dict()
         draft_config["architectures"] = ["Qwen3DSparkModel"]
         draft_config["num_hidden_layers"] = draft_num_hidden_layers
         draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
@@ -899,13 +892,13 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         """Run one batch through live target capture or the offline cache."""
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         return self.trainer_module(
-            input_ids=batch.input_ids,
-            target_hidden_states=batch.target_hidden_states,
-            loss_mask=batch.loss_mask,
-            target_last_hidden_states=batch.target_last_hidden_states,
-            position_ids=batch.position_ids,
-            seq_lens=batch.seq_lens,
-            doc_remaining=batch.doc_remaining,
+            input_ids=batch["input_ids"],
+            target_hidden_states=batch["target_hidden_states"],
+            loss_mask=batch["loss_mask"],
+            target_last_hidden_states=batch["target_last_hidden_states"],
+            position_ids=batch["position_ids"],
+            seq_lens=batch["seq_lens"],
+            doc_remaining=batch["doc_remaining"],
         )
 
     def _maybe_save_step_checkpoint(self, epoch: int) -> bool:
@@ -996,7 +989,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         running_accept_pos_num = torch.zeros(self.block_size, device=self.device)
         running_accept_pos_den = torch.zeros(self.block_size, device=self.device)
         running_micro = 0
-        is_optim_step = true
+        is_optim_step = True
         # get_sync_ctx handles both DDP (no_sync) and FSDP2 (set_requires_gradient_sync).
         with get_sync_ctx(self.trainer_module, is_optim_step, self.defer_fsdp_grad_sync):
             metrics = self._forward_batch(micro_batch)

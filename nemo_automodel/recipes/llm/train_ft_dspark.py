@@ -780,6 +780,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             dist_env=self.dist_env,
             device_mesh=self.device_mesh,
             target_peft_config=self.peft_config if lm_head_adapted else None,
+            target_config=self.model_parts[0].config,
         )
         self.dspark_recipe.setup()
         shared_vocab_sync_cfg = SharedVocabSyncConfig(sync_interval = int(dspark_cfg.recipe_args.vocab_sync_interval))
@@ -1259,7 +1260,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                     last_id = target_layer_ids[-1]
                     dspark_batch_current["target_last_hidden_states"] = gathered_hidden_states[last_id][start_idx:start_idx+chunk_len]
 
-                    self.dspark_recipe.run_train_step(dspark_batch_current)
+                    self.dspark_recipe.run_train_micro_batch(dspark_batch_current)
 
             finally:
                 gathered_hidden_states.clear()
