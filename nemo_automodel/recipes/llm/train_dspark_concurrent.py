@@ -476,7 +476,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # Gemma4 and MiniMax M3 VL nest their text fields (layer count, vocab)
         # under text_config.
         # 
-        num_target_layers = int(recipe_cfg.get("num_target_layers", None))
+        num_target_layers = int(recipe_cfg.get("num_target_layers", None) or self.target_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
         target_layer_ids = list(
             recipe_cfg.get("target_layer_ids", None)
