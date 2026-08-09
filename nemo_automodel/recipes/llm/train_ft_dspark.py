@@ -1216,49 +1216,56 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             if i == num_batches - 1:
                 prepare_for_final_backward(self.model_parts, pp_enabled=self.pp_enabled)
 
-            cp_sharder = self._forward_backward_step(
-                i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
-            )
-            dspark_batch = self._prepare_dspark_batch(batch)
-
-            dspark_batch = {k : v.to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()}
-            # Add target's hidden states to dspark_batch before sending to draft model
-            dspark_cfg = self.cfg.get("dspark", None)
-            target_layer_ids = dspark_cfg.recipe_args.target_layer_ids
-            num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
-            chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
-
-            # Gather hidden states at target layers.
-            # This requires num_target_layers * local_batch_size *  sequence_length * hidden_size * 2 bytes of vRAM on every GPU. Watch out for OOM errors.
-            # It is assumed that the elements of target_layer_ids are sorted in ascending order
-            # self.captured[layer_id] is a list of length num_chunks, where each element is a tensor of shape [chunk_len, sequence_length/cp_degree, hidden_size]
             gathered_hidden_states = {}
-            for layer_id in target_layer_ids:
-                assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
-                assert self.captured[layer_id][0].shape[0] == chunk_len, f"Captured hidden states for the first micro-batch should have shape [chunk_len, sequence_length/cp_degree, hidden_size], but got {self.captured[layer_id][0].shape}"
-                if self.step_scheduler.step == 1:
-                    print(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
-                    print(f"NK_DEBUG: chunk_len: {chunk_len}")
-                cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
-                cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
-                gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
+            hidden_states_list = None
+            dspark_batch_current = None
+            try:
+                cp_sharder = self._forward_backward_step(
+                    i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
+                )
+                dspark_batch = self._prepare_dspark_batch(batch)
+
+                dspark_batch = {k : v.to(self.dist_env.device, non_blocking=True) for k,v in dspark_batch.items()}
+                # Add target's hidden states to dspark_batch before sending to draft model
+                dspark_cfg = self.cfg.get("dspark", None)
+                target_layer_ids = dspark_cfg.recipe_args.target_layer_ids
+                num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
+                chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
+
+                # Gather hidden states at target layers.
+                # This requires num_target_layers * local_batch_size *  sequence_length * hidden_size * 2 bytes of vRAM on every GPU. Watch out for OOM errors.
+                # It is assumed that the elements of target_layer_ids are sorted in ascending order
+                # self.captured[layer_id] is a list of length num_chunks, where each element is a tensor of shape [chunk_len, sequence_length/cp_degree, hidden_size]
+                for layer_id in target_layer_ids:
+                    assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
+                    assert self.captured[layer_id][0].shape[0] == chunk_len, f"Captured hidden states for the first micro-batch should have shape [chunk_len, sequence_length/cp_degree, hidden_size], but got {self.captured[layer_id][0].shape}"
+                    if self.step_scheduler.step == 1:
+                        print(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
+                        print(f"NK_DEBUG: chunk_len: {chunk_len}")
+                    cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
+                    cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
+                    gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
 
 
-            for idx in range(num_chunks):
-                hidden_states_list = []
-                start_idx = idx * chunk_len
-                for layer_id in target_layer_ids[:-1]:
-                    hidden_states_list.append(gathered_hidden_states[layer_id][start_idx:start_idx+chunk_len])
-                dspark_batch_current = {
-                        k : v[start_idx:start_idx+chunk_len] for k,v in dspark_batch.items()
-                }
-                dspark_batch_current["target_hidden_states"] = torch.cat(hidden_states_list, dim=-1)
-                last_id = target_layer_ids[-1]
-                dspark_batch_current["target_last_hidden_states"] = gathered_hidden_states[last_id][start_idx:start_idx+chunk_len]
+                for idx in range(num_chunks):
+                    hidden_states_list = []
+                    start_idx = idx * chunk_len
+                    for layer_id in target_layer_ids[:-1]:
+                        hidden_states_list.append(gathered_hidden_states[layer_id][start_idx:start_idx+chunk_len])
+                    dspark_batch_current = {
+                            k : v[start_idx:start_idx+chunk_len] for k,v in dspark_batch.items()
+                    }
+                    dspark_batch_current["target_hidden_states"] = torch.cat(hidden_states_list, dim=-1)
+                    last_id = target_layer_ids[-1]
+                    dspark_batch_current["target_last_hidden_states"] = gathered_hidden_states[last_id][start_idx:start_idx+chunk_len]
 
-                self.dspark_recipe.run_train_step([dspark_batch_current])
+                    self.dspark_recipe.run_train_step([dspark_batch_current])
 
-            self.captured.clear()
+            finally:
+                gathered_hidden_states.clear()
+                self.captured.clear()
+                hidden_states_list = None
+                dspark_batch_current = None
 
             if i == 0:
                 prepare_after_first_microbatch()
