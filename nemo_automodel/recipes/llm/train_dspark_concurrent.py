@@ -198,8 +198,7 @@ def get_wsd_lambda(warmup_steps, stable_steps, decay_steps, min_lr_ratio=0.0):
     return lr_lambda
 
 
-def get_warmup_stable_lambda(warmup_steps, min_lr_ratio=0.0):
-    total_steps = warmup_steps + stable_steps
+def get_warmup_stable_lambda(warmup_steps):
 
     def lr_lambda(current_step):
         # 1. Warmup Phase
@@ -644,9 +643,10 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # However, the user should have the option to specify a separate lr_scheduler and 
         # optimizer for the DSpark module.
         total_optim_steps = opt_cfg.get("total_steps", 1)
-        warmup_steps = int(opt_cfg.get("warmup_steps", 100))
+        lr_scheduler_cfg = self.cfg.get("lr_scheduler", None)
+        warmup_steps = int(lr_scheduler_cfg.get("warmup_steps", 100))
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, get_warmup_stable_lambda(warmup_steps, min_lr_ratio=opt_cfg.get("min_lr_ratio", 0.0))
+            self.optimizer, get_warmup_stable_lambda(warmup_steps)
         )
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
@@ -657,7 +657,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # step, else the replicas diverge. _get_dp_rank() returns the global rank
         # when there is no mesh, so the plain world-sharded path is unchanged.
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)) + self._get_dp_rank(), ranked=False)
-        self._build_checkpointer(target_path)
+        self._build_checkpointer(recipe_cfg.get("target_model_name_or_path", None))
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
         self.wandb_run = _init_dspark_wandb(
