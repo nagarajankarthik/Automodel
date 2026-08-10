@@ -505,10 +505,11 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         # model.attn_implementation="magi" (HF) or model.backend.attn="magi" (custom).
         self.magi = setup_magi(self.cfg, self.device_mesh)
 
+        self.wandb_run = None
         if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
-            logging.info("🚀 View run at {}".format(run.url))
+            self.wandb_run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
+            logging.info("🚀 View run at {}".format(self.wandb_run.url))
 
         if self.dist_env.is_main and self.cfg.mlflow is not None:
             run_config = self.cfg.to_yaml_dict(use_orig_values=True)
@@ -1009,6 +1010,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                         )
                     self._maybe_collect_garbage()
         finally:
+            if self.wandb_run is not None:
+                self.wandb_run.finish()
             if pbar is not None:
                 pbar.close()
         # Close JSONL loggers after training loop completes
@@ -1022,7 +1025,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         if self.step_scheduler.sigterm_flag:
             end_mlflow_active_run_as_killed()
         # DSpark cleanup
-        self.dspark_recipe._finish_wandb()
+        if self.dspark_recipe is not None:
+            self.dspark_recipe._finish_wandb()
 
     # ------------------ helpers ------------------
 
@@ -1574,12 +1578,12 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         if not self.dist_env.is_main or log_data is None:
             return
 
-        if wandb.run is not None:
+        if self.wandb_run is not None:
             if val_name == "default":
-                wandb.log(log_data.metrics, step=log_data.step)
+                self.wandb_run.log(log_data.metrics, step=log_data.step)
             else:
                 metrics = {f"val_{val_name}/{k}": v for k, v in log_data.metrics.items()}
-                wandb.log(metrics, step=log_data.step)
+                self.wandb_run.log(metrics, step=log_data.step)
 
         if mlflow.active_run() is not None:
             mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
@@ -1634,8 +1638,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
 
         # Log to remote services (WandB, MLflow, Comet) according to step_scheduler frequency
         if self.step_scheduler.is_remote_logging_step:
-            if wandb.run is not None:
-                wandb.log(log_data.to_dict(), step=self.step_scheduler.step)
+            if self.wandb_run is not None:
+                self.wandb_run.log(log_data.to_dict(), step=self.step_scheduler.step)
             if mlflow.active_run() is not None:
                 mlflow.log_metrics(to_float_metrics(log_data.to_dict()), step=log_data.step)
             if self.comet_logger is not None:
@@ -1644,7 +1648,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         # Log MoE load balance metrics (already collected/reduced on all ranks)
         if self.step_scheduler.is_remote_logging_step:
             if wandb.run is not None:
-                self._log_moe_metrics(self.step_scheduler.step, wandb.log)
+                self._log_moe_metrics(self.step_scheduler.step, self.wandb_run.log)
             if self.comet_logger is not None:
                 self._log_moe_metrics(
                     self.step_scheduler.step, lambda m, step: self.comet_logger.log_metrics(m, step=step)

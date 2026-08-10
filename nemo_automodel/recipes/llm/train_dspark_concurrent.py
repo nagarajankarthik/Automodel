@@ -1096,11 +1096,11 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
                     # diagnostics measured this window, so mirror its keys under
                     # the train/ prefix rather than hard-coding each one.
                     wandb_metrics = {
-                        "train/tv_loss" if key == "l1_loss" else f"train/{key}": value
+                        "tv_loss" if key == "l1_loss" else f"{key}": value
                         for key, value in avg.items()
                     }
                     wandb_metrics.update(
-                        {"train/lr": current_lr, "train/mem_gib": mem}
+                        {"lr": current_lr, "mem_gib": mem}
                     )
                     self._wandb_log(wandb_metrics, step=self.runtime.global_step)
                     accept = avg.get("accept_rate")
