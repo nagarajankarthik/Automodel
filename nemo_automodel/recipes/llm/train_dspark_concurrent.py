@@ -657,7 +657,8 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # step, else the replicas diverge. _get_dp_rank() returns the global rank
         # when there is no mesh, so the plain world-sharded path is unchanged.
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)) + self._get_dp_rank(), ranked=False)
-        self._build_checkpointer(recipe_cfg.get("target_model_name_or_path", None))
+        target_path = recipe_cfg.get("target_model_name_or_path", None)
+        self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
 
         self.wandb_run = _init_dspark_wandb(
@@ -1354,7 +1355,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
 def main(config_path: str | None = None):
     """Entrypoint for ``TrainDSparkRecipe``."""
     cfg = parse_args_and_load_config(config_path)
-    trainer = TrainDSparkRecipe(cfg)
+    trainer = TrainDSparkConcurrentRecipe(cfg)
     trainer.setup()
     trainer.run_train_validation_loop()
 
