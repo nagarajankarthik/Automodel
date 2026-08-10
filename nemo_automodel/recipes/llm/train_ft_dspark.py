@@ -1028,7 +1028,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         """
         Prepare a batch of data with the required attributes for training the draft model.
         """
-        from nemo_automodel.components.llm.datasets.packed_sequence import CROSS_ENTROPY_IGNORE_IDX 
+        from nemo_automodel.components.datasets.llm.packed_sequence import CROSS_ENTROPY_IGNORE_IDX 
         loss_mask = (batch["labels"] != CROSS_ENTROPY_IGNORE_IDX).long()
 
         # See nemo_automodel/components/datasets/utils.py
@@ -1268,29 +1268,34 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
                 packed_seq_len = dspark_batch["input_ids"].shape[1]
                 cp_degree = self.mesh_context.cp_size
+                if self.step_scheduler.step == 1:
+                    print(f"NK_DEBUG: padded_seq_len={cp_sharder.shard_layout.padded_seq_len}, "
+                      f"input_row_shape={cp_sharder.shard_layout.input_row_shape}, cp={cp_degree}")
 
                 # Gather hidden states at target layers.
                 # This requires num_target_layers * local_batch_size *  sequence_length * hidden_size * 2 bytes of vRAM on every GPU. Watch out for OOM errors.
                 # It is assumed that the elements of target_layer_ids are sorted in ascending order
-                # self.captured[layer_id] is a list of length num_chunks, where each element is a tensor of shape [chunk_len, sequence_length/cp_degree, hidden_size]
+                # self.captured[layer_id] is a list of length num_chunks, where each element is a tensor of shape [chunk_len*sequence_length/cp_degree, hidden_size]
                 for layer_id in self.target_layer_ids:
                     if layer_id in self.owned_layers:
                         assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
-                        assert self.captured[layer_id][0].shape[0] == chunk_len, f"Captured hidden states for the first micro-batch should have shape [chunk_len, sequence_length/cp_degree, hidden_size], but got {self.captured[layer_id][0].shape}"
+                        expected_tokens = cp_sharder.shard_layout.padded_seq_len // (cp_degree * num_chunks)
+                        assert self.captured[layer_id][0].ndim == 2, f"Hidden states captured at layer {layer_id} should be 2D but got {self.captured[layer_id][0].ndim}"
+                        assert self.captured[layer_id][0].shape[0] == expected_tokens, f"Dim 0 of hidden states captured at layer {layer_id} should have size {expected_tokens} tokens but got {self.captured[layer_id][0].shape[0]}"
                         if self.step_scheduler.step == 1:
                             print(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
                             print(f"NK_DEBUG: chunk_len: {chunk_len}")
                         cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
                         cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
                     else:
-                        cp_sharded_hidden_states = torch.zeros((num_chunks * chunk_len, cp_sharder.shard_layout.padded_seq_len // cp_degree, self.model_parts[0].config.hidden_size), 
+                        cp_sharded_hidden_states = torch.zeros((cp_sharder.shard_layout.padded_seq_len // cp_degree, self.model_parts[0].config.hidden_size), 
                                                                device=self.dist_env.device,
                                                                dtype = next(self.model_parts[0].parameters()).dtype)
                     
                     if self.pp_enabled:
                         torch.distributed.broadcast(cp_sharded_hidden_states, src=self.layer_src_rank[layer_id], group=self.pp_group)
 
-                    gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
+                    gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, seq_dim = 0, trim = True, fill = 0.0)
 
 
                 for idx in range(num_chunks):
