@@ -649,7 +649,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
             self.optimizer, get_warmup_stable_lambda(warmup_steps)
         )
         self.total_optim_steps = total_optim_steps
-        self.runtime = SimpleNamespace(global_step=0)
+        self.runtime = SimpleNamespace(global_step=0, epoch=0)
         self._resume_epoch = 0
 
         # Seed by the dp coordinate, not the global rank: under CP the draft is
