@@ -63,6 +63,7 @@ from nemo_automodel.components.distributed.init_utils import initialize_distribu
 from nemo_automodel.components.distributed.mesh import MeshContext
 from nemo_automodel.components.distributed.pipelining import AutoPipeline
 from nemo_automodel.components.distributed.utils import FirstRankPerNode, dp_eval_sample_shard, get_sync_ctx
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.mlflow_utils import (
@@ -799,8 +800,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         if self.mesh_context.pp_size > 1:
             pp_mesh = get_flat_mesh(self.device_mesh, "pp")
             self.pp_group = pp_mesh.get_group()
-            torch.distributed.all_reduce(layer_owners, op=dist.ReduceOp.MAX, group=self.pp_group)
-            torch.distributed.all_reduce(layer_counts, op=dist.ReduceOp.SUM, group=self.pp_group)
+            torch.distributed.all_reduce(layer_owners, op=torch.distributed.ReduceOp.MAX, group=self.pp_group)
+            torch.distributed.all_reduce(layer_counts, op=torch.distributed.ReduceOp.SUM, group=self.pp_group)
 
         self.layer_src_rank = {}
         for layer_count, layer_id, layer_owner in zip(layer_counts, self.target_layer_ids, layer_owners):
@@ -1087,6 +1088,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         )
         train_ctx, batch = cp_sharder.shard(batch)
         labels = batch.pop("labels")
+        tokens_per_rank = batch["input_ids"].numel()
         fp8_ctx = self.te_fp8.maybe_te_autocast() if self.te_fp8 is not None else nullcontext()
 
         # TODO: Add functionality to retrieve target's hidden states from selected layers.
@@ -1199,7 +1201,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 loss_buffer.append(local_loss.clone().detach())
                 if is_train:
                     (local_loss * self._get_dp_group_size(include_cp=True)).backward()
-        return cp_sharder
+        return cp_sharder, tokens_per_rank
 
     def _broadcast_from_last_pp_stage(self, tensor: torch.Tensor) -> torch.Tensor:
         """Broadcast a PP last-stage scalar to the other ranks in its pipeline group."""
@@ -1262,7 +1264,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
             hidden_states_list = None
             dspark_batch_current = None
             try:
-                cp_sharder = self._forward_backward_step(
+                cp_sharder, tokens_per_rank = self._forward_backward_step(
                     i, batch, loss_buffer=loss_buffer, num_label_tokens=num_label_tokens, num_batches=num_batches
                 )
                 dspark_batch = self._prepare_dspark_batch(batch)
@@ -1272,11 +1274,6 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 dspark_cfg = self.cfg.get("dspark", None)
                 num_chunks=self.pp.pp_batch_size // self.pp.pp_microbatch_size if self.pp_enabled else 1
                 chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
-                packed_seq_len = dspark_batch["input_ids"].shape[1]
-                cp_degree = self.mesh_context.cp_size
-                if self.step_scheduler.step == 0:
-                    logger.info(f"NK_DEBUG: padded_seq_len={cp_sharder.shard_layout.padded_seq_len}, "
-                      f"input_row_shape={cp_sharder.shard_layout.input_row_shape}, cp={cp_degree}")
 
                 # Gather hidden states at target layers.
                 # This requires num_target_layers * local_batch_size *  sequence_length * hidden_size * 2 bytes of vRAM on every GPU. Watch out for OOM errors.
@@ -1285,7 +1282,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 for layer_id in self.target_layer_ids:
                     if layer_id in self.owned_layers:
                         assert len(self.captured[layer_id]) == num_chunks, f"Expected {num_chunks} chunks for layer {layer_id} but got {len(self.captured[layer_id])}"
-                        expected_tokens = cp_sharder.shard_layout.padded_seq_len // (cp_degree * num_chunks)
+                        expected_tokens = tokens_per_rank // num_chunks
                         assert self.captured[layer_id][0].ndim == 2, f"Hidden states captured at layer {layer_id} should be 2D but got {self.captured[layer_id][0].ndim}"
                         assert self.captured[layer_id][0].shape[0] == expected_tokens, f"Dim 0 of hidden states captured at layer {layer_id} should have size {expected_tokens} tokens but got {self.captured[layer_id][0].shape[0]}"
                         if self.step_scheduler.step == 0:
@@ -1296,15 +1293,20 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                         cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
                         cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
                     else:
-                        cp_sharded_hidden_states = torch.zeros((cp_sharder.shard_layout.padded_seq_len // cp_degree, self.model_parts[0].config.hidden_size), 
+                        cp_sharded_hidden_states = torch.zeros((tokens_per_rank, self.model_parts[0].config.hidden_size), 
                                                                device=self.dist_env.device,
                                                                dtype = next(self.model_parts[0].parameters()).dtype)
                     
                     if self.pp_enabled:
                         torch.distributed.broadcast(cp_sharded_hidden_states, src=self.layer_src_rank[layer_id], group=self.pp_group)
 
-                    gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, seq_dim = 0, trim = True, fill = 0.0)
+                    assert cp_sharded_hidden_states.shape[0] == tokens_per_rank, (
+                        f"layer {layer_id}: concatenated {cp_sharded_hidden_states.shape[0]} rows, buffer expects {tokens_per_rank}"
+                    )
 
+                    gathered_hidden_pad = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, seq_dim = 0, trim = False)
+                    local_batch_size, sequence_length = dspark_batch["input_ids"].shape
+                    gathered_hidden_states[layer_id] = gathered_hidden_pad[: local_batch_size * sequence_length].view(local_batch_size, sequence_length, -1)
 
                 for idx in range(num_chunks):
                     hidden_states_list = []
