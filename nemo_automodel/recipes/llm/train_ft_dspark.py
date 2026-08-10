@@ -1021,6 +1021,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         # Mark the MLflow run KILLED if training exited via SIGTERM.
         if self.step_scheduler.sigterm_flag:
             end_mlflow_active_run_as_killed()
+        # DSpark cleanup
+        self.dspark_recipe._finish_wandb()
 
     # ------------------ helpers ------------------
 
@@ -1268,8 +1270,8 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                 chunk_len = self.pp.pp_microbatch_size if self.pp_enabled else dspark_batch["input_ids"].shape[0]
                 packed_seq_len = dspark_batch["input_ids"].shape[1]
                 cp_degree = self.mesh_context.cp_size
-                if self.step_scheduler.step == 1:
-                    print(f"NK_DEBUG: padded_seq_len={cp_sharder.shard_layout.padded_seq_len}, "
+                if self.step_scheduler.step == 0:
+                    logger.info(f"NK_DEBUG: padded_seq_len={cp_sharder.shard_layout.padded_seq_len}, "
                       f"input_row_shape={cp_sharder.shard_layout.input_row_shape}, cp={cp_degree}")
 
                 # Gather hidden states at target layers.
@@ -1282,9 +1284,11 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                         expected_tokens = cp_sharder.shard_layout.padded_seq_len // (cp_degree * num_chunks)
                         assert self.captured[layer_id][0].ndim == 2, f"Hidden states captured at layer {layer_id} should be 2D but got {self.captured[layer_id][0].ndim}"
                         assert self.captured[layer_id][0].shape[0] == expected_tokens, f"Dim 0 of hidden states captured at layer {layer_id} should have size {expected_tokens} tokens but got {self.captured[layer_id][0].shape[0]}"
-                        if self.step_scheduler.step == 1:
-                            print(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
-                            print(f"NK_DEBUG: chunk_len: {chunk_len}")
+                        if self.step_scheduler.step == 0:
+                            logging.info(f"NK_DEBUG: Shape of captured cp sharded hidden states: {self.captured[layer_id][0].shape}")
+                            logging.info(f"NK_DEBUG: chunk_len: {chunk_len}")
+                            logging.info(f"NK_DEBUG: num_chunks: {num_chunks}")
+                            logging.info(f"NK_DEBUG: num_batches: {len(batches)}")
                         cp_sharded_hidden_states_list = self.captured.get(layer_id, None)
                         cp_sharded_hidden_states = torch.cat(cp_sharded_hidden_states_list, dim = 0)
                     else:
