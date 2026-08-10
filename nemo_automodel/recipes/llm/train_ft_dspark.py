@@ -791,15 +791,15 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         layer_counts = torch.zeros((len(self.target_layer_ids),), dtype=torch.long, device=self.dist_env.device)
         for layer_idx, layer_id in enumerate(self.target_layer_ids):
             if layer_id in self.owned_layers:
-                layer_owners[layer_idx] = dist.get_rank()
+                layer_owners[layer_idx] = torch.distributed.get_rank()
                 layer_counts[layer_idx] = 1
 
         self.pp_group = None
         if self.mesh_context.pp_size > 1:
             pp_mesh = get_flat_mesh(self.device_mesh, "pp")
             self.pp_group = pp_mesh.get_group()
-            dist.all_reduce(layer_owners, op=dist.ReduceOp.MAX, group=self.pp_group)
-            dist.all_reduce(layer_counts, op=dist.ReduceOp.SUM, group=self.pp_group)
+            torch.distributed.all_reduce(layer_owners, op=dist.ReduceOp.MAX, group=self.pp_group)
+            torch.distributed.all_reduce(layer_counts, op=dist.ReduceOp.SUM, group=self.pp_group)
 
         self.layer_src_rank = {}
         for layer_count, layer_id, layer_owner in zip(layer_counts, self.target_layer_ids, layer_owners):
@@ -1288,7 +1288,7 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
                                                                dtype = next(self.model_parts[0].parameters()).dtype)
                     
                     if self.pp_enabled:
-                        dist.broadcast(cp_sharded_hidden_states, src=self.layer_src_rank[layer_id], group=self.pp_group)
+                        torch.distributed.broadcast(cp_sharded_hidden_states, src=self.layer_src_rank[layer_id], group=self.pp_group)
 
                     gathered_hidden_states[layer_id] = cp_sharder.gather_token_tensor(cp_sharded_hidden_states, trim = True, fill = 0.0)
 

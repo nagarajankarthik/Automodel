@@ -125,6 +125,7 @@ from nemo_automodel.recipes.llm._spec_train_utils import (
     optim_steps_per_epoch,
     raise_if_peft_configured,
 )
+from nemo_automodel.components._peft.lora import patch_linear_module
 
 logger = logging.getLogger(__name__)
 
@@ -461,6 +462,7 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         # Sequence packing is supported on the online LLM (text-only) path only; the
         # VLM and offline-cache paths do not carry the block-causal packing metadata.
         self.packed_sequence_size = int(recipe_cfg.get("packed_sequence_size", 0) or 0)
+        self.cached_target_path = None
         if self.packed_sequence_size > 0 and (is_multimodal or self.cached_target_path is not None):
             raise NotImplementedError(
                 "Sequence packing (packed_sequence_size>0) is only supported on the online text-only "
@@ -495,7 +497,6 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
 
         embed_src = None
         head_src = None
-        assert self.cached_target_path is None, "DSpark concurrent training does not support cached targets."
         
         # The Qwen3 / Gemma4 drafts consume a flex_attention BlockMask during training.
         # The DeepSeek V4 and GLM-5.2 drafts instead consume a dense additive mask
@@ -530,6 +531,8 @@ class TrainDSparkConcurrentRecipe(BaseRecipe):
         draft_config_obj = Qwen3Config.from_dict(draft_config)
         draft_config_obj._attn_implementation = attention_backend
 
+        # TODO: hardcode arhcitectures for now
+        architectures = ["Qwen3ForCausalLM"]
         draft_cls = resolve_dspark_draft_spec(architectures).draft_cls
         self.draft_model = draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         if self.target_peft_config is not None:
