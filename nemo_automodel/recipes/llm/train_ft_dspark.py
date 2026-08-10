@@ -402,18 +402,26 @@ def _make_hook(layer_id: int, captured: Dict[int, List[torch.Tensor]]):
 
     return _hook
 
-def attach_capture_hooks(model_parts, target_layer_ids, captured):
+def attach_capture_hooks(model_parts, target_layer_ids, captured, final_norm_id):
     handles, owned = [], set()
     for part in model_parts:                     # interleaved PP → several parts per rank
         backbone = getattr(part, "model", part)
+        mod_norm = getattr(backbone, "norm", None)
         container = getattr(backbone, "layers", None)
-        if container is None:
+        if container is None and mod_norm is None:
+            # This part owns neither decoder layers nor the final norm — legitimate for a
+            # padding virtual stage under round_virtual_stages_to_pp_multiple. Global
+            # coverage is enforced by the layer_counts == 1 assert after discovery.
             continue
         for lid in target_layer_ids:
-            if isinstance(container, nn.ModuleDict):
+            if lid == final_norm_id:
+                mod = mod_norm
+            elif container is None:
+                mod = None
+            elif isinstance(container, nn.ModuleDict):
                 mod = container[str(lid)] if str(lid) in container else None   # global id key
             else:
-                mod = container[lid] if lid < len(container) else None         # ModuleList, off-PP
+                mod = container[lid] if 0 <= lid < len(container) else None         # ModuleList, off-PP
             if mod is not None:
                 handles.append(mod.register_forward_hook(_make_hook(lid, captured)))
                 owned.add(lid)
@@ -773,8 +781,12 @@ class TrainFinetuneRecipeForNextTokenPredictionDSpark(BaseRecipe):
         self.captured = {}
         self.target_layer_ids = list(dspark_cfg.recipe_args.target_layer_ids)
         self.target_layer_ids.sort()
-        self.target_layer_ids.append(self.model_parts[0].config.num_hidden_layers - 1)
-        _hook_handles, self.owned_layers = attach_capture_hooks(self.model_parts, self.target_layer_ids, self.captured)
+        # Final norm is assigned a value of -2 since -1 is already reserved for the embedding.
+        # self.target_layer_ids includes the final norm layer output in this recipe only.
+        # On the draft side, target_layer_ids is identical to to the contents of the config file. 
+        final_norm_id = -2
+        self.target_layer_ids.append(final_norm_id)
+        _hook_handles, self.owned_layers = attach_capture_hooks(self.model_parts, self.target_layer_ids, self.captured, final_norm_id)
         layer_owners = torch.full((len(self.target_layer_ids),), -1, dtype=torch.long, device=self.dist_env.device)
         layer_counts = torch.zeros((len(self.target_layer_ids),), dtype=torch.long, device=self.dist_env.device)
         for layer_idx, layer_id in enumerate(self.target_layer_ids):
